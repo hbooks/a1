@@ -29,7 +29,7 @@ class WinScene extends Phaser.Scene {
     this.add.text(W / 2, 250, won ? 'You win!' : `${this.result.winnerName} wins!`, {
       fontFamily: FONT, fontSize: '64px', fontStyle: '900', color: won ? '#e8b923' : '#f3ead2', stroke: '#000', strokeThickness: 4,
     }).setOrigin(0.5);
-    this.add.text(W / 2, 315, won ? 'Hongera! Your hand is empty.' : 'Mzalendo got there first. Rematch?', { fontFamily: FONT, fontSize: '20px', color: '#f3ead2', fontStyle: 'italic' }).setOrigin(0.5);
+    this.add.text(W / 2, 315, won ? 'Table Cleared. Your hand is empty.' : 'They got there first. Rematch?', { fontFamily: FONT, fontSize: '20px', color: '#f3ead2', fontStyle: 'italic' }).setOrigin(0.5);
     UI.makeButton(this, W / 2, 400, 'Rematch', () => this.scene.start('GameScene', {}));
     UI.makeButton(this, W / 2, 470, 'Main Menu', () => this.scene.start('MainMenuScene'), { fill: 0x24543f, hoverFill: 0x2f6b51, color: '#f3ead2', border: 0xe8b923 });
   }

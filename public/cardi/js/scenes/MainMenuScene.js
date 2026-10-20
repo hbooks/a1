@@ -11,7 +11,7 @@ class MainMenuScene extends Phaser.Scene {
     UI.drawFelt(this);
 
     // Decorative fanned cards.
-    const deco = ['hearts_ace', 'card_back', 'flowers_king', 'card_back', 'spades_jack', 'card_back', 'diamonds_3'];
+    const deco = ['hearts_ace', 'card_back', 'clubs_king', 'card_back', 'spades_jack', 'card_back', 'diamonds_3'];
     deco.forEach((key, i) => {
       const off = i - (deco.length - 1) / 2;
       const img = this.add.image(W / 2 + off * 70, 610 + Math.abs(off) * 10, key).setDisplaySize(110, 160).setAngle(off * 8).setAlpha(0.9);
@@ -24,7 +24,7 @@ class MainMenuScene extends Phaser.Scene {
       stroke: '#5a4300', strokeThickness: 8, shadow: { offsetX: 0, offsetY: 6, color: '#000', blur: 12, fill: true },
     }).setOrigin(0.5);
     this.tweens.add({ targets: title, scale: 1.03, duration: 1800, yoyo: true, repeat: -1, ease: 'Sine.inOut' });
-    this.add.text(W / 2, 228, 'The Kenyan Card Game', { fontFamily: FONT, fontSize: '24px', color: '#f3ead2', fontStyle: 'italic' }).setOrigin(0.5);
+    this.add.text(W / 2, 228, 'Dominate the spinning table', { fontFamily: FONT, fontSize: '24px', color: '#f3ead2', fontStyle: 'italic' }).setOrigin(0.5);
 
     UI.makeButton(this, W / 2, 310, 'Play', () => this.scene.start('GameScene', {}));
     UI.makeButton(this, W / 2, 380, 'Shop', () => this.scene.start('ShopScene'), { fill: 0x24543f, hoverFill: 0x2f6b51, color: '#f3ead2', border: 0xe8b923 });
@@ -54,7 +54,7 @@ class MainMenuScene extends Phaser.Scene {
       '',
       'NIKO CARDI! — When you\'re down to your last card and it can be played, a gold button appears after your opponent moves. Tap it before your turn — or draw 1 card as a foul and lose your turn.',
       '',
-      'Flowers (✿) replace Clubs. Good luck, mzalendo!',
+      'clubs (✿) replace Clubs. Good luck, mzalendo!',
     ].join('\n');
     const body = this.add.text(165, 150, rules, { fontFamily: FONT, fontSize: '18px', color: '#f3ead2', wordWrap: { width: 570 }, lineSpacing: 4 });
     const maskG = this.make.graphics({ add: false }, false);

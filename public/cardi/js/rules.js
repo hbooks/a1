@@ -1,35 +1,20 @@
 /* =====================================================================
  * rules.js — CARDI RULES ENGINE (pure functions, zero Phaser references)
- * ---------------------------------------------------------------------
- * Every rule of Cardi lives here. Functions never mutate their inputs:
- * applyMove() / startTurn() clone the state and return a new one.
- * This file is designed to be reused verbatim by a multiplayer server.
- *
- * Exposed as window.Rules (classic script, no build step).
- *
- * Interpretation notes:
- *  - During an active punishment chain only a 3 (extend) or an Ace
- *    (reduce by 3) may be played; otherwise the player draws the total.
- *  - An Ace played against punishment: remaining = total - 3. If the
- *    remaining is > 0 the Ace player draws it; the chain is then cleared.
- *  - Kickback (King) in a 2-player game returns the turn to its player.
  * ===================================================================== */
 (function (global) {
   'use strict';
 
-  const SUITS = ['hearts', 'spades', 'diamonds', 'flowers'];
+  const SUITS = ['hearts', 'spades', 'diamonds', 'clubs'];
   const RANKS = ['ace', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'jack', 'queen', 'king'];
-  const SUIT_SYMBOLS = { hearts: '♥', spades: '♠', diamonds: '♦', flowers: '✿' };
-  const SUIT_NAMES = { hearts: 'Hearts', spades: 'Spades', diamonds: 'Diamonds', flowers: 'Flowers' };
-  const SUIT_COLORS = { hearts: '#d62828', diamonds: '#f77f00', spades: '#1d1d1d', flowers: '#c9a227' };
+  const SUIT_SYMBOLS = { hearts: '♥', spades: '♠', diamonds: '♦', clubs: '✿' };
+  const SUIT_NAMES = { hearts: 'Hearts', spades: 'Spades', diamonds: 'Diamonds', clubs: 'clubs' };
+  const SUIT_COLORS = { hearts: '#d62828', diamonds: '#f77f00', spades: '#1d1d1d', clubs: '#c9a227' };
   const RANK_SHORT = { ace: 'A', jack: 'J', queen: 'Q', king: 'K' };
   const DISPLAY_NAMES = { king: 'Kickback', jack: 'Jump', queen: 'Queen', ace: 'Ace', 3: 'Foul' };
-  /** Ranks that can never be the opening card. */
   const SPECIAL_RANKS = ['king', 'jack', '3', 'ace'];
   const PUNISHMENT_PER_THREE = 3;
   const ACE_CANCEL_AMOUNT = 3;
 
-  /** Build an ordered 52-card deck (no jokers). */
   function createDeck() {
     const deck = [];
     for (const suit of SUITS) {
@@ -40,7 +25,6 @@
     return deck;
   }
 
-  /** Fisher–Yates shuffle returning a NEW array. rng is injectable for tests. */
   function shuffleDeck(deck, rng = Math.random) {
     const d = deck.slice();
     for (let i = d.length - 1; i > 0; i--) {
@@ -50,7 +34,6 @@
     return d;
   }
 
-  /** Deal handSize cards round-robin to playerCount players. */
   function dealHands(deck, playerCount, handSize = 4) {
     const remaining = deck.slice();
     const hands = Array.from({ length: playerCount }, () => []);
@@ -60,15 +43,10 @@
     return { hands, remaining };
   }
 
-  /** True for King, Jack, 3 and Ace. */
   function isSpecial(card) {
     return SPECIAL_RANKS.includes(card.rank);
   }
 
-  /**
-   * Pick a random opening card from the remaining deck that is not in any
-   * hand and is not special. Returns { openingCard, drawPile }.
-   */
   function selectOpeningCard(remaining, hands = [], rng = Math.random) {
     const inHand = new Set(hands.flat().map((c) => c.id));
     const candidates = [];
@@ -80,11 +58,6 @@
     return { openingCard: remaining[idx], drawPile: remaining.filter((_, i) => i !== idx) };
   }
 
-  /**
-   * Can `card` be played on `topCard`? Aces are always playable.
-   * While punishment is pending only a 3 (or Ace) may be played.
-   * currentSuit overrides the top card's suit (after an Ace).
-   */
   function isPlayable(card, topCard, pendingPunishment = 0, currentSuit) {
     const suit = currentSuit || topCard.suit;
     if (card.rank === 'ace') return true;
@@ -92,27 +65,21 @@
     return card.suit === suit || card.rank === topCard.rank;
   }
 
-  /** All cards in `hand` that may legally be played. */
   function getLegalMoves(hand, topCard, pendingPunishment = 0, currentSuit) {
     return hand.filter((c) => isPlayable(c, topCard, pendingPunishment, currentSuit));
   }
 
-  /** Index of the next player in the given direction (1 / -1). */
   function getNextPlayerIndex(currentIndex, direction, playerCount) {
     return (((currentIndex + direction) % playerCount) + playerCount) % playerCount;
   }
 
-  /** Remaining punishment after `acesPlayed` Aces (never below zero). */
   function resolvePunishment(punishment, acesPlayed) {
     return Math.max(0, punishment - ACE_CANCEL_AMOUNT * acesPlayed);
   }
 
-  /** Human-readable card label, e.g. "Kickback ♥". */
   function cardLabel(card) {
     return `${card.displayName} ${SUIT_SYMBOLS[card.suit]}`;
   }
-
-  /* ---------------- internal helpers (operate on a cloned state) ------ */
 
   function cloneState(state) {
     return typeof structuredClone === 'function' ? structuredClone(state) : JSON.parse(JSON.stringify(state));
@@ -122,20 +89,18 @@
     s.log = [...(s.log || []), msg].slice(-30);
   }
 
-  /** Move discard pile (except top card) into a freshly shuffled draw pile. */
   function reshuffleDiscard(s, rng) {
     const top = s.discardPile.pop();
     s.drawPile = shuffleDeck(s.discardPile, rng);
     s.discardPile = [top];
   }
 
-  /** Draw `count` cards for player i, reshuffling when needed. Emits events. */
   function drawCards(s, i, count, reason, rng) {
     const all = [];
     let batch = [];
     for (let k = 0; k < count; k++) {
       if (!s.drawPile.length) {
-        if (s.discardPile.length <= 1) break; // nothing left anywhere
+        if (s.discardPile.length <= 1) break;
         if (batch.length) s.events.push({ type: 'draw', player: i, cards: batch, reason });
         batch = [];
         reshuffleDiscard(s, rng);
@@ -151,7 +116,6 @@
     return all;
   }
 
-  /** Pass the turn to `next` and refresh Niko Cardi flags. */
   function endTurn(s, next) {
     s.lastMoverIndex = s.currentPlayerIndex;
     s.currentPlayerIndex = next;
@@ -162,36 +126,39 @@
     });
   }
 
-  /**
-   * Deferred "Niko Cardi" rule: player i may declare when they hold exactly
-   * one card, it is not (actively) their turn, someone else moved last, and
-   * that last card is playable on the current top card.
-   */
   function canDeclareNiko(state, i) {
     const p = state.players[i];
     if (!p || state.winnerIndex != null || p.hand.length !== 1) return false;
     if (state.declaredNikoCardi[i]) return false;
     if (state.lastMoverIndex === i || state.lastMoverIndex == null) return false;
     if (state.currentPlayerIndex === i && state.turnStarted) return false;
-    return isPlayable(p.hand[0], state.topCard, state.pendingPunishment, state.currentSuit);
+
+    const lastCard = p.hand[0];
+
+    // 1. You can ONLY declare if the last card is a WINNING card (not Special)
+    if (isSpecial(lastCard)) return false;
+
+    // 2. The card must also be playable on the current table
+    return isPlayable(lastCard, state.topCard, state.pendingPunishment, state.currentSuit);
   }
 
-  /**
-   * Begin the current player's turn. Applies the Niko Cardi foul: a player
-   * who had the chance to declare but didn't draws 1 and loses the turn.
-   * Bots declare automatically.
-   */
   function startTurn(state, rng = Math.random) {
     const s = cloneState(state);
     s.events = [];
     const i = s.currentPlayerIndex;
     const pl = s.players[i];
-    if (pl.isBot && pl.hand.length === 1) s.declaredNikoCardi[i] = true;
+
+    if (pl.isBot && pl.hand.length === 1 && !isSpecial(pl.hand[0])) {
+      s.declaredNikoCardi[i] = true;
+    }
+
     const hadChance =
       pl.hand.length === 1 &&
+      !isSpecial(pl.hand[0]) &&
       s.lastMoverIndex != null &&
       s.lastMoverIndex !== i &&
       isPlayable(pl.hand[0], s.topCard, s.pendingPunishment, s.currentSuit);
+
     if (!pl.isBot && hadChance && !s.declaredNikoCardi[i] && s.pendingPunishment === 0) {
       drawCards(s, i, 1, 'foul', rng);
       s.events.push({ type: 'foul', player: i });
@@ -203,12 +170,6 @@
     return s;
   }
 
-  /**
-   * Apply a move and return the NEW state (input is never mutated).
-   * move: { type:'play', card, chosenSuit? } | { type:'draw' } | { type:'pass' }
-   *     | { type:'declare', playerIndex? }
-   * The returned state carries `events` describing what happened (for UI).
-   */
   function applyMove(state, move, rng = Math.random) {
     if (state.winnerIndex != null) throw new Error('Game is over');
     const s = cloneState(state);
@@ -230,37 +191,98 @@
     let next = getNextPlayerIndex(p, s.direction, n);
 
     if (move.type === 'play') {
-      const idx = pl.hand.findIndex((c) => c.id === move.card.id);
-      if (idx < 0) throw new Error('Card not in hand');
-      const card = pl.hand[idx];
-      if (s.drawnCardId && card.id !== s.drawnCardId) throw new Error('Only the drawn card may be played');
-      if (!isPlayable(card, s.topCard, s.pendingPunishment, s.currentSuit)) throw new Error('Illegal play');
+      const cardsToPlay = Array.isArray(move.cards) ? move.cards : [move.card];
+      if (!cardsToPlay.length) throw new Error('No cards to play');
 
-      pl.hand.splice(idx, 1);
-      s.discardPile.push(card);
-      s.topCard = card;
-      s.currentSuit = card.suit;
-      s.events.push({ type: 'play', player: p, card });
-      const sym = SUIT_SYMBOLS[card.suit];
+      // STRICT BATCH VALIDATION
+      if (cardsToPlay.length > 1) {
+        const opener = cardsToPlay[0];
+        if (!isPlayable(opener, s.topCard, s.pendingPunishment, s.currentSuit)) {
+          throw new Error(`Opener ${opener.id} does not match the table.`);
+        }
+        const targetRank = opener.rank;
+        for (let i = 1; i < cardsToPlay.length; i++) {
+          if (cardsToPlay[i].rank !== targetRank) {
+            throw new Error(`Batch failed: ${cardsToPlay[i].id} does not match rank ${targetRank}.`);
+          }
+        }
+      } else {
+        if (!isPlayable(cardsToPlay[0], s.topCard, s.pendingPunishment, s.currentSuit)) {
+          throw new Error(`Card ${cardsToPlay[0].id} does not match the table.`);
+        }
+      }
 
-      switch (card.rank) {
+      let lastCard = s.topCard;
+      let currentSuit = s.currentSuit;
+
+      for (const cardToPlay of cardsToPlay) {
+        const idx = pl.hand.findIndex((c) => c.id === cardToPlay.id);
+        if (idx < 0) throw new Error('Card not in hand');
+        const card = pl.hand[idx];
+
+        pl.hand.splice(idx, 1);
+        s.discardPile.push(card);
+        s.topCard = card;
+        lastCard = card;
+        currentSuit = card.suit;
+
+        s.events.push({ type: 'play', player: p, card });
+      }
+
+      const finalCard = cardsToPlay[cardsToPlay.length - 1];
+      const sym = SUIT_SYMBOLS[finalCard.suit];
+      s.currentSuit = finalCard.suit;
+
+      switch (finalCard.rank) {
         case 'ace': {
-          const chosen = SUITS.includes(move.chosenSuit) ? move.chosenSuit : card.suit;
-          s.currentSuit = chosen;
-          s.events.push({ type: 'suit', player: p, suit: chosen });
           if (s.pendingPunishment > 0) {
             const before = s.pendingPunishment;
-            const remaining = resolvePunishment(before, 1);
-            s.pendingPunishment = 0;
-            addLog(s, `${pl.name}'s Ace cuts punishment ${before} → ${remaining}`);
-            if (remaining > 0) drawCards(s, p, remaining, 'punishment', rng);
+            const acesPlayed = cardsToPlay.filter(c => c.rank === 'ace').length;
+
+            // Each Ace cancels 3 punishment points
+            const punishmentCancelled = acesPlayed * ACE_CANCEL_AMOUNT;
+            const remainingPunishment = Math.max(0, before - punishmentCancelled);
+
+            // Calculate how many Aces were "spent" purely canceling punishment
+            const acesSpentOnPunishment = Math.ceil(Math.min(before, punishmentCancelled) / ACE_CANCEL_AMOUNT);
+
+            // The "leftover" Aces have the power to change the suit
+            const leftoverAces = acesPlayed - acesSpentOnPunishment;
+
+            s.pendingPunishment = remainingPunishment;
+
+            if (remainingPunishment > 0) {
+              // If the punishment wasn't fully cancelled, you draw the rest
+              drawCards(s, p, remainingPunishment, 'punishment', rng);
+              s.events.push({ type: 'foul', player: p });
+              s.currentSuit = finalCard.suit;
+              addLog(s, `${pl.name} played ${acesPlayed} Ace(s) but still took ${remainingPunishment} cards.`);
+            } else {
+              // Punishment is fully canceled.
+              if (leftoverAces > 0) {
+                // You have leftover Aces! You get to choose the suit.
+                const chosen = SUITS.includes(move.chosenSuit) ? move.chosenSuit : finalCard.suit;
+                s.currentSuit = chosen;
+                s.events.push({ type: 'suit', player: p, suit: chosen });
+                addLog(s, `${pl.name} cancelled punishment and used a leftover Ace to choose ${SUIT_SYMBOLS[chosen]}`);
+              } else {
+                // All Aces were spent canceling. No popup. Suit follows the Ace.
+                s.currentSuit = finalCard.suit;
+                addLog(s, `${pl.name} played ${acesPlayed} Ace(s) to exactly cancel punishment.`);
+              }
+            }
+          } else {
+            // Normal Ace play (no punishment): Ask for suit
+            const chosen = SUITS.includes(move.chosenSuit) ? move.chosenSuit : finalCard.suit;
+            s.currentSuit = chosen;
+            s.events.push({ type: 'suit', player: p, suit: chosen });
+            addLog(s, `${pl.name} played Ace, chose ${SUIT_SYMBOLS[chosen]}`);
           }
-          addLog(s, `${pl.name} played Ace, chose ${SUIT_SYMBOLS[chosen]}`);
           break;
         }
         case '3':
-          s.pendingPunishment += PUNISHMENT_PER_THREE;
-          addLog(s, `${pl.name} played Foul ${sym} — punishment ${s.pendingPunishment}`);
+          s.pendingPunishment += (PUNISHMENT_PER_THREE * cardsToPlay.length);
+          addLog(s, `${pl.name} played Foul x${cardsToPlay.length} — punishment ${s.pendingPunishment}`);
           break;
         case 'king':
           s.direction *= -1;
@@ -274,13 +296,18 @@
           break;
         }
         default:
-          addLog(s, `${pl.name} played ${cardLabel(card)}`);
+          addLog(s, `${pl.name} played ${cardLabel(finalCard)}`);
       }
 
       if (pl.hand.length === 0) {
-        s.winnerIndex = p;
-        addLog(s, `${pl.name} wins!`);
-        return s;
+        if (isSpecial(finalCard)) {
+          addLog(s, `${pl.name} cannot win on a ${finalCard.displayName}. Drawing 1 card.`);
+          drawCards(s, p, 1, 'foul', rng);
+        } else {
+          s.winnerIndex = p;
+          addLog(s, `${pl.name} wins!`);
+          return s;
+        }
       }
       endTurn(s, next);
       return s;
@@ -288,19 +315,24 @@
 
     if (move.type === 'draw') {
       if (s.drawnCardId) throw new Error('Already drew this turn');
+
       if (s.pendingPunishment > 0) {
         const amt = s.pendingPunishment;
         s.pendingPunishment = 0;
         drawCards(s, p, amt, 'punishment', rng);
-        addLog(s, `${pl.name} drew ${amt} (punishment)`);
+        addLog(s, `${pl.name} took the ${amt} punishment`);
         endTurn(s, next);
         return s;
       }
-      if (getLegalMoves(pl.hand, s.topCard, 0, s.currentSuit).length) throw new Error('Must play a legal card');
+
       const drawn = drawCards(s, p, 1, 'draw', rng);
       addLog(s, `${pl.name} drew a card`);
-      if (drawn.length && isPlayable(drawn[0], s.topCard, 0, s.currentSuit)) s.drawnCardId = drawn[0].id;
-      else endTurn(s, next);
+
+      if (drawn.length && isPlayable(drawn[0], s.topCard, 0, s.currentSuit)) {
+        s.drawnCardId = drawn[0].id;
+      } else {
+        endTurn(s, next);
+      }
       return s;
     }
 
