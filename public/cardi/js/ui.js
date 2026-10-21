@@ -44,7 +44,16 @@
       c.setInteractive({ useHandCursor: true });
       c.on('pointerover', () => { draw(true); scene.tweens.add({ targets: c, scale: 1.05, duration: 120 }); });
       c.on('pointerout', () => { draw(false); scene.tweens.add({ targets: c, scale: 1, duration: 120 }); });
-      c.on('pointerdown', () => onClick());
+
+      // --- AUTOMATIC CLICK SOUND FOR ALL BUTTONS ---
+      c.on('pointerdown', () => {
+        if (scene.cache.audio.exists('sfx_click')) {
+          scene.sound.play('sfx_click', { volume: 1 });
+        }
+        onClick();
+      });
+      // ---------------------------------------------
+
       c.label = t;
       c.redraw = draw;
       return c;
