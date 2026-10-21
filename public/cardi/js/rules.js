@@ -15,6 +15,68 @@
   const PUNISHMENT_PER_THREE = 3;
   const ACE_CANCEL_AMOUNT = 3;
 
+  // --- SCORING ENGINE ---
+  function evaluateScore(prevState, nextState, playerIndex, playedCards) {
+    let points = 0;
+    const reasons = [];
+    if (!playedCards || playedCards.length === 0) return { points, reasons };
+
+    const finalCard = playedCards[playedCards.length - 1];
+    const opponentIndex = (playerIndex + 1) % nextState.players.length;
+    const opponentWasNearWin = prevState.players[opponentIndex].hand.length === 1;
+
+    // 1. Multi-Card Combo
+    if (playedCards.length === 2) {
+      points += 2;
+      reasons.push(`Combo x2 (+2)`);
+    } else if (playedCards.length >= 3) {
+      points += 3;
+      reasons.push(`Mega Combo x${playedCards.length} (+3)`);
+    }
+
+    // 2. Tactical Block / Sniper Foul (Playing a 3)
+    if (finalCard.rank === '3') {
+      const hadPunishment = prevState.pendingPunishment > 0;
+      if (hadPunishment && playedCards.length === 1) {
+        points += 4;
+        reasons.push(`Tactical Block (+4)`);
+      } else if (!hadPunishment && opponentWasNearWin) {
+        points += 4;
+        reasons.push(`Sniper Foul (+4)`);
+      }
+    }
+
+    // 3. Sniper Kickback (Playing a King)
+    if (finalCard.rank === 'king' && opponentWasNearWin) {
+      points += 5;
+      reasons.push(`Sniper Kickback (+5)`);
+    }
+
+    // 4. Sniper Jump (Playing a Jack)
+    if (finalCard.rank === 'jack' && opponentWasNearWin) {
+      points += 6;
+      reasons.push(`Sniper Jump (+6)`);
+    }
+
+    // 5. Ace Override
+    if (finalCard.rank === 'ace') {
+      const hadPunishment = prevState.pendingPunishment > 0;
+      const cancelledPunishment = nextState.pendingPunishment === 0;
+      const acesPlayed = playedCards.filter(c => c.rank === 'ace').length;
+
+      if (hadPunishment && cancelledPunishment) {
+        const spent = Math.ceil(Math.min(prevState.pendingPunishment, acesPlayed * 3) / 3);
+        if (acesPlayed > spent) {
+          points += 7;
+          reasons.push(`Ace Override (+7)`);
+        }
+      }
+    }
+
+    return { points, reasons };
+  }
+  // ---------------------
+
   function createDeck() {
     const deck = [];
     for (const suit of SUITS) {
@@ -238,41 +300,32 @@
           if (s.pendingPunishment > 0) {
             const before = s.pendingPunishment;
             const acesPlayed = cardsToPlay.filter(c => c.rank === 'ace').length;
-
-            // Each Ace cancels 3 punishment points
             const punishmentCancelled = acesPlayed * ACE_CANCEL_AMOUNT;
             const remainingPunishment = Math.max(0, before - punishmentCancelled);
-
-            // Calculate how many Aces were "spent" purely canceling punishment
             const acesSpentOnPunishment = Math.ceil(Math.min(before, punishmentCancelled) / ACE_CANCEL_AMOUNT);
-
-            // The "leftover" Aces have the power to change the suit
             const leftoverAces = acesPlayed - acesSpentOnPunishment;
 
-            s.pendingPunishment = remainingPunishment;
+            // THE FIX: Clear the punishment immediately so it doesn't leak
+            s.pendingPunishment = 0;
 
             if (remainingPunishment > 0) {
-              // If the punishment wasn't fully cancelled, you draw the rest
+              // The player who played the Ace takes the remaining punishment
               drawCards(s, p, remainingPunishment, 'punishment', rng);
               s.events.push({ type: 'foul', player: p });
               s.currentSuit = finalCard.suit;
               addLog(s, `${pl.name} played ${acesPlayed} Ace(s) but still took ${remainingPunishment} cards.`);
             } else {
-              // Punishment is fully canceled.
               if (leftoverAces > 0) {
-                // You have leftover Aces! You get to choose the suit.
                 const chosen = SUITS.includes(move.chosenSuit) ? move.chosenSuit : finalCard.suit;
                 s.currentSuit = chosen;
                 s.events.push({ type: 'suit', player: p, suit: chosen });
                 addLog(s, `${pl.name} cancelled punishment and used a leftover Ace to choose ${SUIT_SYMBOLS[chosen]}`);
               } else {
-                // All Aces were spent canceling. No popup. Suit follows the Ace.
                 s.currentSuit = finalCard.suit;
                 addLog(s, `${pl.name} played ${acesPlayed} Ace(s) to exactly cancel punishment.`);
               }
             }
           } else {
-            // Normal Ace play (no punishment): Ask for suit
             const chosen = SUITS.includes(move.chosenSuit) ? move.chosenSuit : finalCard.suit;
             s.currentSuit = chosen;
             s.events.push({ type: 'suit', player: p, suit: chosen });
@@ -309,6 +362,18 @@
           return s;
         }
       }
+
+      // --- SCORING ENGINE HOOK ---
+      if (s.scores) {
+        const result = evaluateScore(state, s, p, cardsToPlay);
+        if (result.points > 0) {
+          s.scores[p] += result.points;
+          result.reasons.forEach(r => addLog(s, `Smart Play: ${pl.name} earned ${r}`));
+          s.events.push({ type: 'score', player: p, points: result.points, reasons: result.reasons });
+        }
+      }
+      // ---------------------------
+
       endTurn(s, next);
       return s;
     }

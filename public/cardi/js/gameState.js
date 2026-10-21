@@ -47,6 +47,7 @@
       drawnCardId: null,
       log: [`Opening card: ${R.cardLabel(openingCard)}`],
       events: [],
+      scores: players.map(() => 0),
     };
   }
 
