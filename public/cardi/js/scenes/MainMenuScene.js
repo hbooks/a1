@@ -203,64 +203,87 @@ class MainMenuScene extends Phaser.Scene {
   showMultiplayerModal() {
     this.modal = MK.modal(this, { title: 'ONLINE PLAY', w: 480, h: 330 }, (panel) => {
 
+      // Helper to get or create an anonymous client ID
+      const getClientId = () => {
+        let id = localStorage.getItem('cardi_client_id');
+        if (!id) {
+          // Generate a v4 UUID
+          id = crypto.randomUUID();
+          localStorage.setItem('cardi_client_id', id);
+        }
+        return id;
+      };
+
       // CREATE ROOM
-      panel.add(MK.btn(this, 0, -60, 'Create Room', () => {
-        // Show loading state
-        const btn = panel.list[panel.list.length - 1]; // Get the button we just added
-        btn.label.setText('Creating...');
-        btn.disableInteractive();
+      const createBtn = MK.btn(this, 0, -60, 'Create Room', () => {
+        createBtn.label.setText('Creating...');
+        createBtn.disableInteractive();
 
         const roomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+        const clientId = getClientId();
 
         fetch('/api?action=create', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             roomCode: roomCode,
-            hostId: 'user_123', // Clerk ID later
-            hostName: 'You'
+            hostId: clientId,
+            hostName: 'Host' // Or your username later
           })
         })
-          .then(res => res.json())
+          .then(res => {
+            // Check if the response is JSON before parsing
+            const contentType = res.headers.get("content-type");
+            if (!contentType || !contentType.includes("application/json")) {
+              throw new Error("Server returned HTML instead of JSON. API route is broken.");
+            }
+            return res.json();
+          })
           .then(data => {
             if (data.error) throw new Error(data.error);
 
             // Success: Show the room code
-            panel.removeAll(true); // Clear the modal content
+            panel.removeAll(true);
             panel.add(this.add.text(0, -80, 'ROOM CREATED', { fontFamily: UI.FONT, fontSize: '24px', fontStyle: '900', color: '#e8b923' }).setOrigin(0.5));
             panel.add(this.add.text(0, -20, 'Share this code:', { fontFamily: UI.FONT, fontSize: '16px', color: '#cfe3d8' }).setOrigin(0.5));
             panel.add(this.add.text(0, 30, roomCode, { fontFamily: UI.FONT, fontSize: '48px', fontStyle: '900', color: '#fff', letterSpacing: 10 }).setOrigin(0.5));
+
             panel.add(MK.btn(this, 0, 110, 'Start Game', () => {
-              // This will connect to Supabase Realtime later
-              MK.toast(this, 'Waiting for players...');
+              MK.toast(this, 'Waiting for players (Realtime coming next)');
             }, { w: 160, h: 42, primary: true }));
           })
           .catch(err => {
-            btn.label.setText('Create Room');
-            btn.setInteractive();
+            createBtn.label.setText('Create Room');
+            createBtn.setInteractive();
             MK.toast(this, err.message);
           });
-      }, { w: 260, h: 52 }));
+      }, { w: 260, h: 52 });
+      panel.add(createBtn);
 
       // JOIN ROOM
       panel.add(MK.btn(this, 0, 10, 'Join Room', () => {
-        // We use a native prompt for simplicity, or you can build a custom input modal
         const code = window.prompt("Enter the 6-character room code:");
         if (!code || code.length !== 6) return;
+        const clientId = getClientId();
 
         fetch('/api?action=join', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             roomCode: code.toUpperCase(),
-            userId: 'user_456',
+            userId: clientId,
             playerName: 'Guest'
           })
         })
-          .then(res => res.json())
+          .then(res => {
+            const contentType = res.headers.get("content-type");
+            if (!contentType || !contentType.includes("application/json")) {
+              throw new Error("Server returned HTML instead of JSON.");
+            }
+            return res.json();
+          })
           .then(data => {
             if (data.error) throw new Error(data.error);
-            // Success! In the future, this starts the GameScene with multiplayer data
             MK.toast(this, `Joined room! Seat ${data.seatIndex + 1}`);
             this.modal.close();
           })
