@@ -38,6 +38,7 @@ const DISCARD_X = 545;
 const HAND_Y = 612;
 const PLATE_W = 172;
 const PLATE_H = 56;
+const POP_Y = 258;        // the one 'stage' where every big pop-up appears
 
 const Z = { hand: 10, selected: 120, hover: 300, fly: 700, fx: 900, toast: 2000, modal: 3000, pause: 3500 };
 const GOLD = 0xe8b923;
@@ -88,8 +89,13 @@ class GameScene extends Phaser.Scene {
     this.lastDirection = 1;
     this.dropHintOn = false;
     this.pauseTweens = [];
-    this.passTimer = null;            
-    this.passTimerRing = null;         
+    this.passTimer = null;
+    this.passTimerRing = null;
+    this.popQ = [];                 // pop-up lane (see queuePopup)
+    this.popBusy = false;
+    this.popLive = 0;
+    this.popMax = 0;
+    this.acePrefix = null;
 
     UI.drawFelt(this);
     this.ensureTextures();
@@ -121,6 +127,14 @@ class GameScene extends Phaser.Scene {
       this.input.off('pointerup', this.onPtrUp, this);
       this.input.off('wheel', this.onWheel, this);
       if (this.input.keyboard) this.input.keyboard.off('keydown-ESC', this.onEsc, this);
+    });
+
+    // --- WAKE LISTENER ---
+    // When Settings closes and wakes the game, make sure we are still paused safely
+    this.events.on('wake', () => {
+      if (this.paused) {
+        this.time.paused = true;
+      }
     });
 
     this.startDealSequence();
@@ -350,7 +364,10 @@ class GameScene extends Phaser.Scene {
     }).setOrigin(0.5).setAlpha(0).setDepth(55);
 
     this.passBtn = UI.makeButton(this, 650, 500, 'Pass', () => {
-      if (this.isHumanTurn() && !this.busy && !this.paused && this.state.drawnCardId) this.clearPassTimer(); this.perform({ type: 'pass' });
+      if (this.isHumanTurn() && !this.busy && !this.paused && this.state.drawnCardId) {
+        this.clearPassTimer();
+        this.perform({ type: 'pass' });
+      }
     }, { width: 110, height: 40, fontSize: '18px' }).setVisible(false).setDepth(60);
   }
 
@@ -799,16 +816,79 @@ class GameScene extends Phaser.Scene {
     this.tweens.add({ targets: r, scale: 4.5, alpha: 0, duration: 520, ease: 'Cubic.out', onComplete: () => r.destroy() });
   }
 
-  /** Big pop-up text over the table (KICKBACK!, FOUL +3, DOUBLE ×2, suit, NO ANSWER...). */
-  announce(text, color = '#e8b923', size = 44) {
-    const t = this.add.text(TABLE_CX, 268, text, {
-      fontFamily: UI.FONT, fontSize: `${size}px`, fontStyle: '900', color, stroke: '#000000', strokeThickness: 7,
-    }).setOrigin(0.5).setDepth(Z.fx).setScale(0.3).setAlpha(0);
-    this.tweens.add({
-      targets: t, scale: 1, alpha: 1, duration: 230, ease: 'Back.out',
-      onComplete: () => this.tweens.add({ targets: t, y: 222, alpha: 0, delay: 520, duration: 420, ease: 'Quad.in', onComplete: () => t.destroy() }),
+  /* ---------- POP-UP LANE ----------
+   * Every big pop-up (KICKBACK!, FOUL +3, suit, +N POINTS, YOU WIN...) goes through ONE
+   * lane and plays strictly one after another: fade in -> hold -> fade out. They can never
+   * overlap. If several pile up, the hold time shortens so the lane keeps up with the game,
+   * stale low-priority ones are skipped, and score/win pop-ups are never dropped.
+   * prio: 0 = minor, 1 = normal, 2 = must-show */
+  announce(text, color = '#e8b923', size = 44, opts = {}) {
+    return this.queuePopup({ text, color, size, prio: 1, ...opts });
+  }
+
+  queuePopup(spec) {
+    spec.t0 = this.clock;
+    if (this.popQ.length >= 4) {
+      const i = this.popQ.findIndex((p) => p.prio < 2);
+      if (i >= 0) this.popQ.splice(i, 1);
+      else if (spec.prio < 2) return this.wait(120);
+    }
+    this.popQ.push(spec);
+    this.pumpPopups();
+    return this.wait(spec.pace ?? 200);          // the game does not wait for the whole pop-up
+  }
+
+  async pumpPopups() {
+    if (this.popBusy) return;
+    this.popBusy = true;
+    while (this.popQ.length && this.alive()) {
+      const spec = this.popQ.shift();
+      if (spec.prio < 2 && this.clock - spec.t0 > 2400) continue;   // too late to matter
+      await this.showPopup(spec);
+    }
+    this.popBusy = false;
+  }
+
+  popupIdle() {
+    return new Promise((resolve) => {
+      const check = () => (!this.alive() || (!this.popBusy && !this.popQ.length) ? resolve() : this.time.delayedCall(80, check));
+      check();
     });
-    return this.wait(260);
+  }
+
+  async showPopup(spec) {
+    const backlog = this.popQ.length;
+    const hold = spec.hold ?? (backlog >= 3 ? 240 : backlog === 2 ? 340 : backlog === 1 ? 480 : 780);
+    const col = Phaser.Display.Color.HexStringToColor(spec.color).color;
+    const c = this.add.container(TABLE_CX, POP_Y).setDepth(Z.fx).setAlpha(0);
+
+    const label = this.add.text(0, 0, spec.text, {
+      fontFamily: UI.FONT, fontSize: `${spec.size}px`, fontStyle: '900', color: spec.color,
+      stroke: '#000000', strokeThickness: Math.max(4, Math.round(spec.size / 8)),
+    }).setOrigin(0.5);
+    let sub = null;
+    if (spec.sub) sub = this.add.text(0, 0, spec.sub, { fontFamily: UI.FONT, fontSize: '14px', fontStyle: 'bold', color: '#f3ead2' }).setOrigin(0.5);
+
+    const w = Math.max(label.width, sub ? sub.width : 0) + 56;
+    const h = label.height + 14 + (sub ? sub.height + 10 : 0);
+    const r = Math.min(h / 2, 30);
+    const bg = this.add.graphics();
+    bg.fillStyle(0x040d08, 0.74).fillRoundedRect(-w / 2, -h / 2, w, h, r);
+    bg.lineStyle(2, col, 0.9).strokeRoundedRect(-w / 2, -h / 2, w, h, r);
+    c.add([bg, label]);
+    label.setY(sub ? -h / 2 + (label.height + 14) / 2 : 0);
+    if (sub) { sub.setY(h / 2 - (sub.height + 10) / 2 - 2); c.add(sub); }
+
+    const fit = Math.min(1, 440 / w);
+    c.setScale(0.86 * fit);
+    this.popLive++; this.popMax = Math.max(this.popMax, this.popLive);
+    if (spec.onShow) spec.onShow();
+    await this.tweenP({ targets: c, alpha: 1, scale: fit, duration: 170, ease: 'Back.out' });
+    if (spec.afterIn) spec.afterIn();
+    await this.wait(hold);
+    await this.tweenP({ targets: c, alpha: 0, y: POP_Y - 16, duration: 210, ease: 'Quad.in' });
+    c.destroy();
+    this.popLive--;
   }
 
   floatLabel(text, x, y, color = '#ffffff') {
@@ -902,37 +982,32 @@ class GameScene extends Phaser.Scene {
     this.passBtn.setVisible(showPass);
 
     if (showPass && !this.passTimer) {
-      // 1. Create the timer ring behind the button
-      this.passTimerRing = this.add.graphics().setDepth(59); // Behind button
-
-      // 2. Start the 4-second countdown
+      // 4-second auto-pass countdown: a draining bar under the Pass button
+      this.passTimerRing = this.add.graphics().setDepth(59);
+      const bx = this.passBtn.x, by = this.passBtn.y + 30, bw = 104;
       this.passTimer = this.tweens.addCounter({
         from: 1,
         to: 0,
         duration: 4000,
         onUpdate: (tween) => {
-          const val = tween.getValue();
-          this.passTimerRing.clear();
-          if (val > 0) {
-            // Draw a red ring draining
-            this.passTimerRing.lineStyle(4, 0xff3b3b, 0.8);
-            this.passTimerRing.beginPath();
-            // The button is at x:590, y:470, width:110, height:40
-            // We draw an arc around it
-            this.passTimerRing.arc(590, 470, 26, -Math.PI / 2, (-Math.PI / 2) + (Math.PI * 2 * val), false);
-            this.passTimerRing.strokePath();
+          const v = tween.getValue();
+          const g = this.passTimerRing;
+          if (!g || !g.scene) return;
+          g.clear();
+          g.fillStyle(0x000000, 0.5).fillRoundedRect(bx - bw / 2, by - 3, bw, 6, 3);
+          if (v > 0) {
+            const col = v < 0.3 ? 0xd62828 : v < 0.6 ? 0xf77f00 : 0x28a745;
+            g.fillStyle(col, 0.95).fillRoundedRect(bx - bw / 2, by - 3, bw * v, 6, 3);
           }
         },
         onComplete: () => {
-          // 3. AUTO PASS!
-          if (this.isHumanTurn() && this.state.drawnCardId) {
-            this.perform({ type: 'pass' });
-          }
+          // AUTO PASS!
+          if (this.isHumanTurn() && this.state.drawnCardId) this.perform({ type: 'pass' });
           this.clearPassTimer();
-        }
+        },
       });
     } else if (!showPass && this.passTimer) {
-      // If the player played the card or passed manually, kill the timer
+      // played the card or passed manually: kill the timer
       this.clearPassTimer();
     }
 
@@ -1132,16 +1207,25 @@ class GameScene extends Phaser.Scene {
       this.render();
       const humanWon = s.winnerIndex === this.humanIndex;
       if (humanWon) this.confetti(); else this.flash(0x000000, 0.35);
-      this.sfx('sfx_win', 1.0); 
-      this.announce(humanWon ? 'YOU WIN!' : `${s.players[s.winnerIndex].name} wins`, humanWon ? '#e8b923' : '#ff6b6b', 52);
-      this.time.delayedCall(1750, () => this.scene.start('WinScene', {
-        winnerIndex: s.winnerIndex,
-        winnerName: s.players[s.winnerIndex].name,
-        humanWon,
-        humanName: this.options.humanName,
-        botName: this.options.botName,
-        scores: s.scores, // <--- Pass the array of scores
-      }));
+      this.sfx('sfx_win', 1.0);
+      this.announce(humanWon ? 'YOU WIN!' : `${s.players[s.winnerIndex].name} wins`, humanWon ? '#e8b923' : '#ff6b6b', 52, { prio: 2, hold: 1000 });
+      this.popupIdle().then(() => {
+        if (!this.alive()) return;
+        this.time.delayedCall(250, () => {
+          this.cameras.main.fadeOut(380, 0, 0, 0);
+          this.time.delayedCall(400, () => this.scene.start('WinScene', {
+            winnerIndex: s.winnerIndex,
+            winnerName: s.players[s.winnerIndex].name,
+            humanWon,
+            humanName: this.options.humanName,
+            botName: this.options.botName,
+            names: s.players.map((p) => p.name),     // every player, for the scoreboard
+            localIndex: this.humanIndex,
+            players: this.options.players,           // roster, so Rematch keeps the same table
+            scores: s.scores,
+          }));
+        });
+      });
       return;
     }
 
@@ -1264,15 +1348,12 @@ class GameScene extends Phaser.Scene {
       if (e.type === 'play') {
         const batch = [e];
         while (events[i + 1] && events[i + 1].type === 'play' && events[i + 1].player === e.player) batch.push(events[++i]);
-        await this.animPlayBatch(batch);
+        await this.animPlayBatch(batch, events[i + 1]);
       } else if (e.type === 'draw') await this.animDraw(e);
       else if (e.type === 'reshuffle') await this.animReshuffle();
       else if (e.type === 'foul') await this.animFoul(e);
       else if (e.type === 'suit') await this.animSuit(e);
-
-      // --- ADD THIS LINE ---
       else if (e.type === 'score') await this.animScore(e);
-      // ---------------------
     }
   }
 
@@ -1313,7 +1394,7 @@ class GameScene extends Phaser.Scene {
     });
   }
 
-  async animPlayBatch(batch) {
+  async animPlayBatch(batch, next) {
     const pendBefore = this.state.pendingPunishment;
     const who = batch[0].player;
     await Promise.all(batch.map((e, k) => this.flyPlayed(e, k)));
@@ -1327,11 +1408,15 @@ class GameScene extends Phaser.Scene {
     else if (last.rank === 'jack') { this.seatAction(who, `Jump ${sym}${times}`); await this.announce('JUMP!', '#ffd166'); }
     else if (last.rank === '3') { this.seatAction(who, `Foul ${sym}${times}`); this.cameras.main.shake(180, 0.004); await this.announce(`FOUL!  +${3 * n}`, '#ff6b6b'); }
     else if (last.rank === 'ace') {
-      if (pendBefore > 0 && Rules.resolvePunishment(pendBefore, n) === 0) { this.seatAction(who, 'Cancelled!'); this.flash(0x2fa36b, 0.18); await this.announce('CANCELLED!', '#6df0a8'); }
+      const cancels = pendBefore > 0 && Rules.resolvePunishment(pendBefore, n) === 0;
+      const suitNext = !!(next && next.type === 'suit' && next.player === who);
+      if (cancels) { this.seatAction(who, 'Cancelled!'); this.flash(0x2fa36b, 0.18); }
+      if (suitNext) this.acePrefix = cancels ? 'CANCELLED' : (n > 1 ? `ACE ×${n}` : 'ACE');   // merged into the suit pop-up
+      else if (cancels) await this.announce('CANCELLED!', '#6df0a8');
       else await this.announce(n > 1 ? `ACE ×${n}` : 'ACE!', '#e8b923');
     } else {
       this.seatAction(who, `Played ${last.displayName} ${sym}${times}`);
-      if (n > 1) await this.announce(`${['', '', 'DOUBLE', 'TRIPLE', 'QUAD'][n] || 'COMBO'}  ×${n}`, '#cfe3d8', 38);
+      if (n > 1) await this.announce(`${['', '', 'DOUBLE', 'TRIPLE', 'QUAD'][n] || 'COMBO'}  ×${n}`, '#cfe3d8', 36, { prio: 0 });
     }
   }
 
@@ -1386,7 +1471,7 @@ class GameScene extends Phaser.Scene {
 
   async animReshuffle() {
     this.sfx('sfx_rg');
-    this.showToast('Reshuffling…', '#cfe3d8', 300);
+    this.announce('RESHUFFLING', '#cfe3d8', 24, { prio: 0, hold: 360, pace: 0 });
     const keep = this.vw.discard.slice(-1);
     const moved = Math.max(0, this.vw.discardCount - 1);
     this.vw.discard = keep; this.vw.discardCount = 1;
@@ -1413,73 +1498,21 @@ class GameScene extends Phaser.Scene {
     this.vw.suit = e.suit;
     this.updateSuitUI(e.suit);
     this.seatAction(e.player, `Ace → ${Rules.SUIT_SYMBOLS[e.suit]} ${this.suitName(e.suit)}`);
-    await this.announce(`${Rules.SUIT_SYMBOLS[e.suit]} ${this.suitName(e.suit)}`, this.suitColorCss(e.suit), 36);
+    const prefix = this.acePrefix || 'ACE';
+    this.acePrefix = null;
+    await this.announce(`${prefix}  →  ${Rules.SUIT_SYMBOLS[e.suit]} ${this.suitName(e.suit)}`, this.suitColorCss(e.suit), 34);
   }
 
   async animScore(e) {
     const isHuman = e.player === this.humanIndex;
-    const reasons = e.reasons ? e.reasons.join(' | ') : '';
-    const pName = isHuman ? 'YOU' : this.options.botName.toUpperCase();
-
-    this.sfx('sfx_score', 0.9);
-
-    // 1. Main Text (Moved down to y: 490)
-    const pointsTxt = this.add.text(TABLE_CX, 490, `+${e.points} POINTS`, {
-      fontFamily: UI.FONT,
-      fontSize: '52px',
-      fontStyle: '900',
-      color: '#ffd54a',
-      shadow: { offsetX: 0, offsetY: 4, color: '#000', blur: 10, fill: true }
-    }).setOrigin(0.5).setDepth(Z.fx).setScale(0.3).setAlpha(0);
-
-    // 2. Subtitle (Moved down to y: 535)
-    const subContainer = this.add.container(TABLE_CX, 535).setDepth(Z.fx).setAlpha(0);
-
-    const subBg = this.add.graphics();
-    subBg.fillStyle(0x000000, 0.8).fillRoundedRect(-140, -16, 280, 32, 16);
-    subBg.lineStyle(2, GOLD, 0.6).strokeRoundedRect(-140, -16, 280, 32, 16);
-
-    const subTxt = this.add.text(0, 0, `${pName} : ${reasons}`, {
-      fontFamily: UI.FONT,
-      fontSize: '14px',
-      fontStyle: 'bold',
-      color: '#ffffff'
-    }).setOrigin(0.5);
-
-    subContainer.add([subBg, subTxt]);
-
-    // 3. The Pop Animation
-    this.tweens.add({
-      targets: pointsTxt,
-      scale: 1,
-      alpha: 1,
-      duration: 250,
-      ease: 'Back.out',
-      onComplete: () => {
-        this.cameras.main.shake(120, 0.004);
-
-        // Fade in subtitle sliding up
-        subContainer.y = 545; // start lower
-        this.tweens.add({ targets: subContainer, alpha: 1, y: 535, duration: 250, ease: 'Back.out' });
-
-        // Hold, then fade out
-        this.time.delayedCall(2000, () => {
-          this.tweens.add({
-            targets: [pointsTxt, subContainer],
-            alpha: 0,
-            y: '-=30',
-            duration: 400,
-            ease: 'Quad.in',
-            onComplete: () => {
-              pointsTxt.destroy();
-              subContainer.destroy();
-            }
-          });
-        });
-      }
+    const reasons = e.reasons ? e.reasons.join('  |  ') : '';
+    const who = isHuman ? 'YOU' : String(this.seats[e.player].player.name).toUpperCase();
+    return this.queuePopup({
+      text: `+${e.points} POINTS`, color: '#ffd54a', size: 42, sub: reasons ? `${who}  ·  ${reasons}` : who,
+      prio: 2, hold: 1500, pace: 500,
+      onShow: () => this.sfx('sfx_score', 0.9),
+      afterIn: () => this.cameras.main.shake(120, 0.004),
     });
-
-    await this.wait(500);
   }
 
   /* ------------------------------------------------------------------ */
@@ -1586,7 +1619,6 @@ class GameScene extends Phaser.Scene {
     return v;
   }
 
-  /** button used in the pause menu. kind: primary | secondary | danger */
   pauseButton(parent, x, y, w, h, label, kind, onClick, sub) {
     const { FONT } = UI;
     const c = this.add.container(x, y);
@@ -1615,11 +1647,19 @@ class GameScene extends Phaser.Scene {
     c.setSize(w, h).setInteractive({ useHandCursor: true });
     c.on('pointerover', () => { draw(true); this.pt({ targets: c, scale: 1.03, duration: 90 }); });
     c.on('pointerout', () => { draw(false); this.pt({ targets: c, scale: 1, duration: 90 }); });
-    c.on('pointerdown', () => { this.pt({ targets: c, scale: { from: 0.96, to: 1 }, duration: 140 }); onClick(c); });
+
+    // --- THE FIX: Added sound trigger here ---
+    c.on('pointerdown', () => {
+      if (this.cache.audio.exists('sfx_click')) {
+        this.sound.play('sfx_click', { volume: 1 });
+      }
+      this.pt({ targets: c, scale: { from: 0.96, to: 1 }, duration: 140 });
+      onClick(c);
+    });
+
     parent.add(c);
     return c;
   }
-
   clearPauseView() {
     if (this.pauseView) { this.pauseView.destroy(); this.pauseView = null; }
     if (this.listMask) { this.listMask.destroy(); this.listMask = null; }
@@ -1635,7 +1675,8 @@ class GameScene extends Phaser.Scene {
     this.pauseLayer.add(v);
 
     const log = this.state.log || [];
-    const last = log.length ? log[log.length - 1] : 'No moves yet';
+    let last = log.length ? log[log.length - 1] : 'No moves yet';
+    if (last.length > 27) last = last.slice(0, 26) + '…';      // one line only, so it never collides with the label
     this.pauseButton(v, 0, -104, 300, 62, 'Resume', 'primary', () => this.closePause());
     const mv = this.pauseButton(v, 0, -28, 300, 62, 'Moves', 'secondary', () => this.showMoves(), last);
     // chevron + count chip
@@ -1701,10 +1742,11 @@ class GameScene extends Phaser.Scene {
   openSettings() {
     const has = this.scene.manager && this.scene.manager.keys && this.scene.manager.keys['SettingsScene'];
     if (!has) { this.pauseNote('Settings coming soon'); return; }
-    this.scene.launch('SettingsScene', { from: 'GameScene' });
-    this.scene.pause();
-  }
 
+    // Put the game to sleep (freezes it) and launch settings on top
+    this.scene.sleep();
+    this.scene.launch('SettingsScene', { returnScene: 'GameScene' });
+  }
   /* ---------- Moves (full log) ---------- */
   actorOf(line) {
     for (const seat of this.seats) {

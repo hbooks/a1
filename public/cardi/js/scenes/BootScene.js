@@ -9,19 +9,26 @@ class BootScene extends Phaser.Scene {
 
   preload() {
     const { W, H, FONT } = UI;
+    UI.drawFelt(this);
+    this.add.text(W / 2, H / 2 - 110, 'CARDI', { fontFamily: FONT, fontSize: '80px', fontStyle: '900', color: '#e8b923', stroke: '#5a4300', strokeThickness: 6 }).setOrigin(0.5);
+    const label = this.add.text(W / 2, H / 2 - 30, 'Shuffling the deck…', { fontFamily: FONT, fontSize: '20px', color: '#f3ead2' }).setOrigin(0.5);
+    const tips = ['Aces cut a punishment by 3.', 'Shout NIKO CARDI at one card left.', 'Kings reverse the table.', 'Jacks skip the next player.', 'Stack 3s to pass the foul along.'];
+    this.add.text(W / 2, H / 2 + 80, tips[Phaser.Math.Between(0, tips.length - 1)], { fontFamily: FONT, fontSize: '16px', fontStyle: 'italic', color: '#9fbfae' }).setOrigin(0.5);
     const bar = this.add.graphics();
-    const label = this.add.text(W / 2, H / 2 - 40, 'Shuffling the deck…', { fontFamily: FONT, fontSize: '22px', color: '#e8b923' }).setOrigin(0.5);
-    this.load.on('progress', (v) => {
+    const draw = (v) => {
       bar.clear();
-      bar.fillStyle(0x000000, 0.4).fillRoundedRect(W / 2 - 160, H / 2, 320, 16, 8);
-      bar.fillStyle(0xe8b923, 1).fillRoundedRect(W / 2 - 160, H / 2, Math.max(16, 320 * v), 16, 8);
-    });
-    this.load.on('complete', () => { bar.destroy(); label.destroy(); });
-    // Placeholder art paths; failures fall back silently.
-    this.load.on('loaderror', () => {});
-    this.load.setPath('assets/cards/');
-    Rules.createDeck().forEach((c) => this.load.image(c.id, `${c.id}.png`));
-    this.load.image('card_back', 'back.png');
+      bar.fillStyle(0x000000, 0.45).fillRoundedRect(W / 2 - 170, H / 2, 340, 18, 9);
+      bar.fillStyle(0xe8b923, 1).fillRoundedRect(W / 2 - 170, H / 2, Math.max(18, 340 * v), 18, 9);
+    };
+    draw(0);
+    this.load.on('progress', (v) => { draw(v); label.setText(`Shuffling the deck… ${Math.round(v * 100)}%`); });
+    this.load.on('loaderror', () => { }); // missing art falls back to generated cards
+    this.load.audio('sfx_click', MK.BASE + 'assets/ck.wav'); // tiny; the big music loads after the menu shows
+    if (window.CARDI_CARD_ART) { // set window.CARDI_CARD_ART = true once /assets/cards/*.png exist
+      this.load.setPath(MK.BASE + 'assets/cards/');
+      Rules.createDeck().forEach((c) => this.load.image(c.id, `${c.id}.png`));
+      this.load.image('card_back', 'back.png');
+    }
   }
 
   create() {
@@ -29,7 +36,11 @@ class BootScene extends Phaser.Scene {
       if (!this.textures.exists(c.id)) this.makeCardTexture(c);
     });
     if (!this.textures.exists('card_back')) this.makeBackTexture();
-    this.scene.start('MainMenuScene');
+    const v = localStorage.getItem('cardi_vol');
+    if (v !== null) this.sound.volume = parseFloat(v);
+    this.sound.mute = localStorage.getItem('cardi_mute') === '1';
+    this.cameras.main.once('camerafadeoutcomplete', () => this.scene.start('MainMenuScene'));
+    this.cameras.main.fadeOut(250, 15, 36, 28);
   }
 
   /** Draw a text object into a dynamic texture. */

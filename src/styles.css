@@ -132,6 +132,77 @@
   --sidebar-ring: oklch(0.551 0.027 264.364);
 }
 
+/* --- SQUARE SNAKE LOADER --- */
+.snake-block {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  background-color: #e8b923;
+  /* Gold */
+  border-radius: 2px;
+  box-shadow: 0 0 8px rgba(232, 185, 35, 0.6);
+  opacity: 0;
+}
+
+/* 
+  The path goes: Top-Right -> Bottom-Right -> Bottom-Left -> Top-Left -> Top-Right 
+  We use 4 separate animations for the 4 blocks, with staggered delays.
+*/
+
+@keyframes snakePath {
+  0% {
+    top: 0;
+    left: 0;
+    opacity: 1;
+  }
+
+  /* Top Left */
+  25% {
+    top: 0;
+    left: calc(100% - 12px);
+    opacity: 1;
+  }
+
+  /* Top Right */
+  50% {
+    top: calc(100% - 12px);
+    left: calc(100% - 12px);
+    opacity: 1;
+  }
+
+  /* Bottom Right */
+  75% {
+    top: calc(100% - 12px);
+    left: 0;
+    opacity: 1;
+  }
+
+  /* Bottom Left */
+  100% {
+    top: 0;
+    left: 0;
+    opacity: 1;
+  }
+
+  /* Back to Top Left */
+}
+
+.block1 {
+  animation: snakePath 2s linear infinite;
+}
+
+.block2 {
+  animation: snakePath 2s linear infinite 0.15s;
+}
+
+.block3 {
+  animation: snakePath 2s linear infinite 0.3s;
+}
+
+.block4 {
+  animation: snakePath 2s linear infinite 0.45s;
+}
+
 @layer base {
   * {
     border-color: var(--color-border);
