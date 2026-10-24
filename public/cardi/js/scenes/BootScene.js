@@ -1,6 +1,5 @@
 /* =====================================================================
- * BootScene — loads card art from /assets/cards/{suit}_{rank}.png and
- * generates clean programmatic fallbacks for anything that fails.
+ * BootScene — Simple centered loader with secure config fetch.
  * ===================================================================== */
 class BootScene extends Phaser.Scene {
   constructor() {
@@ -8,39 +7,94 @@ class BootScene extends Phaser.Scene {
   }
 
   preload() {
-    const { W, H, FONT } = UI;
-    UI.drawFelt(this);
-    this.add.text(W / 2, H / 2 - 110, 'CARDI', { fontFamily: FONT, fontSize: '80px', fontStyle: '900', color: '#e8b923', stroke: '#5a4300', strokeThickness: 6 }).setOrigin(0.5);
-    const label = this.add.text(W / 2, H / 2 - 30, 'Shuffling the deck…', { fontFamily: FONT, fontSize: '20px', color: '#f3ead2' }).setOrigin(0.5);
-    const tips = ['Aces cut a punishment by 3.', 'Shout NIKO CARDI at one card left.', 'Kings reverse the table.', 'Jacks skip the next player.', 'Stack 3s to pass the foul along.'];
-    this.add.text(W / 2, H / 2 + 80, tips[Phaser.Math.Between(0, tips.length - 1)], { fontFamily: FONT, fontSize: '16px', fontStyle: 'italic', color: '#9fbfae' }).setOrigin(0.5);
-    const bar = this.add.graphics();
-    const draw = (v) => {
-      bar.clear();
-      bar.fillStyle(0x000000, 0.45).fillRoundedRect(W / 2 - 170, H / 2, 340, 18, 9);
-      bar.fillStyle(0xe8b923, 1).fillRoundedRect(W / 2 - 170, H / 2, Math.max(18, 340 * v), 18, 9);
-    };
-    draw(0);
-    this.load.on('progress', (v) => { draw(v); label.setText(`Shuffling the deck… ${Math.round(v * 100)}%`); });
-    this.load.on('loaderror', () => { }); // missing art falls back to generated cards
-    this.load.audio('sfx_click', MK.BASE + 'assets/ck.wav'); // tiny; the big music loads after the menu shows
-    if (window.CARDI_CARD_ART) { // set window.CARDI_CARD_ART = true once /assets/cards/*.png exist
+    // Get the actual screen center
+    const cx = this.scale.width / 2;
+    const cy = this.scale.height / 2;
+
+    // 1. The Centered Pulsing Text
+    const loadText = this.add.text(cx, cy - 30, 'Loading Assets...', {
+      fontFamily: UI.FONT,
+      fontSize: '28px',
+      fontStyle: '900',
+      color: '#e8b923',
+      shadow: { offsetX: 0, offsetY: 4, color: '#000', blur: 8, fill: true }
+    }).setOrigin(0.5);
+
+    // Pulse animation for the text
+    this.tweens.add({
+      targets: loadText,
+      scale: 1.08,
+      alpha: 0.7,
+      duration: 800,
+      yoyo: true,
+      repeat: -1,
+      ease: 'Sine.inOut'
+    });
+
+    // 2. The Progress Bar (Directly under the text)
+    const barWidth = 240;
+    const barY = cy + 20;
+
+    const barBg = this.add.graphics();
+    const barFill = this.add.graphics();
+
+    // Background track
+    barBg.fillStyle(0x000000, 0.5).fillRoundedRect(cx - barWidth / 2, barY, barWidth, 10, 5);
+    barBg.lineStyle(2, 0x2e5242, 1).strokeRoundedRect(cx - barWidth / 2, barY, barWidth, 10, 5);
+
+    // 3. Fetch Secure Config (Invisible to user, happens in background)
+    this.fetchConfig();
+
+    // 4. Update Progress Bar & Load Assets
+    this.load.on('progress', (v) => {
+      barFill.clear();
+      if (v > 0) {
+        barFill.fillStyle(0xe8b923, 1).fillRoundedRect(cx - barWidth / 2, barY, Math.max(10, barWidth * v), 10, 5);
+      }
+    });
+
+    this.load.on('complete', () => {
+      loadText.setText('Ready!');
+      // Brief pause before transitioning
+      this.time.delayedCall(300, () => {
+        this.cameras.main.fadeOut(400, 15, 36, 28);
+        this.cameras.main.once('camerafadeoutcomplete', () => this.scene.start('MainMenuScene'));
+      });
+    });
+
+    // Load sounds
+    this.load.audio('sfx_click', MK.BASE + 'assets/ck.wav');
+
+    // Load card art if it exists
+    if (window.CARDI_CARD_ART) {
       this.load.setPath(MK.BASE + 'assets/cards/');
       Rules.createDeck().forEach((c) => this.load.image(c.id, `${c.id}.png`));
       this.load.image('card_back', 'back.png');
     }
   }
 
+  async fetchConfig() {
+    try {
+      const res = await fetch('/api/config');
+      if (res.ok) {
+        window.CARDI_CONFIG = await res.json();
+      }
+    } catch (e) {
+      console.warn('Could not load secure config', e);
+    }
+  }
+
   create() {
+    // Generate fallback card textures if the images failed to load
     Rules.createDeck().forEach((c) => {
       if (!this.textures.exists(c.id)) this.makeCardTexture(c);
     });
     if (!this.textures.exists('card_back')) this.makeBackTexture();
+
+    // Load volume and mute settings
     const v = localStorage.getItem('cardi_vol');
     if (v !== null) this.sound.volume = parseFloat(v);
     this.sound.mute = localStorage.getItem('cardi_mute') === '1';
-    this.cameras.main.once('camerafadeoutcomplete', () => this.scene.start('MainMenuScene'));
-    this.cameras.main.fadeOut(250, 15, 36, 28);
   }
 
   /** Draw a text object into a dynamic texture. */

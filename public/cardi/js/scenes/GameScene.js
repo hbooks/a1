@@ -134,7 +134,12 @@ class GameScene extends Phaser.Scene {
 
       if (supabaseUrl && supabaseKey) {
         const supabase = window.supabase.createClient(supabaseUrl, supabaseKey);
-        this.channel = supabase.channel('room:' + this.options.online.roomCode);
+        this.channel = supabase.channel('room:' + this.options.online.roomCode, {
+          config: {
+            broadcast: { self: true }, // Allows the sender to receive their own messages (useful for testing)
+            private: false             // <--- THIS IS THE CRITICAL FIX
+          }
+        });
 
         this.channel
           .on('broadcast', { event: 'intent_play' }, async (payload) => {
