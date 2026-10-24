@@ -73,14 +73,35 @@ class BootScene extends Phaser.Scene {
     }
   }
 
-  async fetchConfig() {
+  async fetchConfig(statusText) {
     try {
-      const res = await fetch('/api/config');
+      const res = await fetch('/config', {
+        method: 'GET',
+        headers: {
+          'x-cardi-client': 'true' // Tell the server we are the game
+        }
+      });
+
       if (res.ok) {
-        window.CARDI_CONFIG = await res.json();
+        const contentType = res.headers.get("content-type");
+
+        // Make sure we actually got JSON back, not just a text "OK"
+        if (contentType && contentType.includes("application/json")) {
+          window.CARDI_CONFIG = await res.json();
+          if (window.CARDI_CONFIG.supabaseUrl) {
+            statusText.setText('Secure connection established');
+          } else {
+            statusText.setText('Warning: Supabase keys missing in env');
+          }
+        } else {
+          statusText.setText('Server returned invalid config format');
+        }
+      } else {
+        statusText.setText('Failed to load config');
       }
     } catch (e) {
       console.warn('Could not load secure config', e);
+      statusText.setText('Offline mode');
     }
   }
 
