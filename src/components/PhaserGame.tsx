@@ -2,11 +2,22 @@ import { useEffect, useRef, useState } from "react";
 
 const BASE = "/cardi/";
 const PHASER_URL = "https://cdn.jsdelivr.net/npm/phaser@3.80.1/dist/phaser.min.js";
+// Cache-buster for the game scripts. Dev: changes on every full page load. Prod: bump VITE_CARDI_BUILD per deploy.
+// Kept on window so React hot-reload never re-executes already-loaded scripts (that would redeclare their classes).
+const BUILD: string = (() => {
+    if (typeof window === "undefined") return "1"; // server render: no window
+    const w = window as any;
+    if (!w.__CARDI_BUILD__) {
+        const env = (import.meta as any).env;
+        w.__CARDI_BUILD__ = env?.DEV ? String(Date.now()) : env?.VITE_CARDI_BUILD || "1";
+    }
+    return w.__CARDI_BUILD__ as string;
+})();
 const SCRIPTS = [
     "js/ui.js", "js/names.js", "js/rules.js", "js/gameState.js", "js/bot.js",
     "js/scenes/BootScene.js", "js/scenes/MainMenuScene.js", "js/scenes/GameScene.js",
     "js/scenes/WinScene.js", "js/scenes/ShopScene.js", "js/scenes/SettingsScene.js", "js/main.js",
-].map((s) => BASE + s);
+].map((s) => `${BASE}${s}?v=${BUILD}`);
 
 const CSS = `
 .cardi-stage{position:relative;width:96px;height:140px;perspective:700px;margin-bottom:14px}
@@ -63,7 +74,6 @@ export default function PhaserGame() {
     const [slow, setSlow] = useState(false);
     const [online, setOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
     const [attempt, setAttempt] = useState(0);
-    const [hintGone, setHintGone] = useState(false);
     const phaseRef = useRef<Phase>("loading");
     phaseRef.current = phase;
 
@@ -123,15 +133,8 @@ export default function PhaserGame() {
             style={{ paddingTop: "env(safe-area-inset-top)", paddingBottom: "env(safe-area-inset-bottom)" }}>
             <style>{CSS}</style>
             {/* Phaser fills everything; Scale.FIT handles the aspect ratio */}
-            <div ref={containerRef} className="absolute inset-0" />
-
-            {/* Portrait phones: the table is landscape, nudge to rotate (dismissible) */}
-            {phase === "ready" && !hintGone && (
-                <button onClick={() => setHintGone(true)}
-                    className="hidden portrait:max-md:flex absolute bottom-4 left-1/2 -translate-x-1/2 z-40 items-center gap-2 rounded-full bg-black/70 px-4 py-2 text-xs font-bold text-[#f3ead2]">
-                    ⟳ Rotate your phone for a bigger table · tap to dismiss
-                </button>
-            )}
+            <div ref={containerRef} className="absolute"
+                style={{ inset: "env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)" }} />
 
             {/* Connection lost mid-game: non-blocking */}
             {phase === "ready" && !online && (

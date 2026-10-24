@@ -19,8 +19,9 @@
           if (!cam) return;
           const w = game.scale.width, h = game.scale.height;
           cam.setSize(w, h);
-          cam.setZoom(Math.min(w / UI.W, h / UI.H));
-          cam.centerOn(UI.W / 2, UI.H / 2);
+          const d = scene.getDesign ? scene.getDesign() : { w: UI.W, h: UI.H };
+          cam.setZoom(Math.min(w / d.w, h / d.h));
+          cam.centerOn(d.w / 2, d.h / 2);
         };
         game.scene.scenes.forEach((s) => { s.events.on('start', () => fit(s)); s.events.on('wake', () => fit(s)); });
         game.scale.on('resize', () => game.scene.scenes.forEach(fit));

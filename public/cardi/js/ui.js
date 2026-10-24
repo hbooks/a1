@@ -15,9 +15,10 @@
 
     /** Visible world rect for the current screen (design area is 900x700, centered). */
     view(scene) {
-      const sc = scene.scale, z = Math.min(sc.width / UI.W, sc.height / UI.H);
+      const d = scene.getDesign ? scene.getDesign() : { w: UI.W, h: UI.H };
+      const sc = scene.scale, z = Math.min(sc.width / d.w, sc.height / d.h);
       const vw = sc.width / z, vh = sc.height / z;
-      return { left: (UI.W - vw) / 2, right: (UI.W + vw) / 2, top: (UI.H - vh) / 2, bottom: (UI.H + vh) / 2, zoom: z };
+      return { left: (d.w - vw) / 2, right: (d.w + vw) / 2, top: (d.h - vh) / 2, bottom: (d.h + vh) / 2, zoom: z };
     },
 
     /** Rounded gold button with hover scale. Returns a container. */
@@ -130,7 +131,8 @@
         for (let i = 0; i < 14; i++) { g.fillStyle(0x1a3a2e, 0.12 + i * 0.06); g.fillEllipse(w / 2, h / 2, w * 1.3 - i * 53, h * 1.2 - i * 40); }
         g.generateTexture('felt_bg', w, h); g.destroy();
       }
-      return scene.add.image(UI.W / 2, UI.H / 2, 'felt_bg').setDisplaySize(4000, 3000).setDepth(-1000);
+      const d = scene.getDesign ? scene.getDesign() : { w: UI.W, h: UI.H };
+      return scene.add.image(d.w / 2, d.h / 2, 'felt_bg').setDisplaySize(4000, 3000).setDepth(-1000);
     },
   };
   global.UI = UI;

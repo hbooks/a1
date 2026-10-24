@@ -1,0 +1,320 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { neon } from "@neondatabase/serverless";
+
+/**
+ * Cardi rooms API  (POST /api?action=create | join | status | leave)
+ *
+ * Lifecycle
+ *  - create : host picks a name + max players (2-4, host included). Server makes the room code.
+ *  - join   : player picks a name, enters the code. Seat = lowest free seat.
+ *  - status : polled by every client in the waiting room (also the heartbeat).
+ *             When the last seat fills, the room flips to 'playing' with a shared seed.
+ *  - leave  : a guest just frees their seat. If the HOST leaves, the room is deleted.
+ *  - Ghost cleanup: anyone silent for STALE_SECS is dropped (host silent => room deleted).
+ *
+ * Run cardi_migration.sql in Neon once before using this file.
+ */
+
+type Sql = ReturnType<typeof neon>;
+type Id = string | number;
+type RoomRow = { id: Id; status: string; max_players: number | null; seed: string | number | null };
+
+const STALE_SECS = 90; // generous: players may switch to WhatsApp to share the code
+const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // no 0/O/1/I/L
+
+const json = (data: unknown, status = 200) =>
+    new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
+const fail = (status: number, code: string, error: string) => json({ error, code }, status);
+
+function rows<T>(r: unknown): T[] {
+    return r as T[];
+}
+const cleanName = (v: unknown) =>
+    String(v ?? "")
+        .replace(/\p{Cc}/gu, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 14);
+const normCode = (v: unknown) => String(v ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+const validId = (v: unknown): v is string => typeof v === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(v);
+const makeCode = () =>
+    Array.from({ length: 6 }, () => CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)]).join("");
+
+const MSG_NOT_FOUND =
+    "We couldn't find that room. It may have closed, so double-check the code or ask the host for a new one.";
+
+async function findRoom(sql: Sql, code: string): Promise<RoomRow | undefined> {
+    return rows<RoomRow>(
+        await sql`SELECT id, status, max_players, seed FROM cardi_rooms WHERE room_code = ${code}`,
+    )[0];
+}
+
+async function destroyRoom(sql: Sql, roomId: Id) {
+    await sql`DELETE FROM cardi_room_players WHERE room_id = ${roomId}`;
+    await sql`DELETE FROM cardi_rooms WHERE id = ${roomId}`;
+}
+
+/** Drops silent guests; deletes the room if the host went silent. Returns false if the room is gone. */
+async function pruneRoom(sql: Sql, roomId: Id): Promise<boolean> {
+    const host = rows<{ stale: boolean }>(
+        await sql`
+      SELECT (p.last_seen < now() - make_interval(secs => ${STALE_SECS})) AS stale
+      FROM cardi_room_players p
+      JOIN cardi_rooms r ON r.id = p.room_id AND r.host_id = p.user_id
+      WHERE p.room_id = ${roomId}`,
+    )[0];
+    if (!host || host.stale) {
+        await destroyRoom(sql, roomId);
+        return false;
+    }
+    await sql`
+    DELETE FROM cardi_room_players p
+    USING cardi_rooms r
+    WHERE p.room_id = ${roomId} AND r.id = p.room_id AND p.user_id <> r.host_id
+      AND p.last_seen < now() - make_interval(secs => ${STALE_SECS})`;
+    return true;
+}
+
+/** A person can only be in one waiting room at a time. Their hosted rooms are deleted. */
+async function leaveEverywhere(sql: Sql, userId: string, exceptRoomId?: Id) {
+    const hosted = rows<{ id: Id }>(
+        await sql`SELECT id FROM cardi_rooms WHERE host_id = ${userId}`,
+    );
+    for (const r of hosted) {
+        if (exceptRoomId !== undefined && String(r.id) === String(exceptRoomId)) continue;
+        await destroyRoom(sql, r.id);
+    }
+    if (exceptRoomId !== undefined) {
+        await sql`
+      DELETE FROM cardi_room_players
+      WHERE user_id = ${userId}
+        AND room_id IN (SELECT id FROM cardi_rooms WHERE status = 'waiting' AND id <> ${exceptRoomId})`;
+    } else {
+        await sql`
+      DELETE FROM cardi_room_players
+      WHERE user_id = ${userId}
+        AND room_id IN (SELECT id FROM cardi_rooms WHERE status = 'waiting')`;
+    }
+}
+
+/** Waiting rooms nobody has touched for a long time (closed tabs) are removed. */
+async function sweepAbandoned(sql: Sql) {
+    await sql`
+    DELETE FROM cardi_room_players
+    WHERE room_id IN (
+      SELECT r.id FROM cardi_rooms r
+      WHERE r.status = 'waiting' AND NOT EXISTS (
+        SELECT 1 FROM cardi_room_players p
+        WHERE p.room_id = r.id AND p.last_seen > now() - make_interval(secs => ${STALE_SECS * 2})))`;
+    await sql`
+    DELETE FROM cardi_rooms r
+    WHERE r.status = 'waiting' AND NOT EXISTS (SELECT 1 FROM cardi_room_players p WHERE p.room_id = r.id)`;
+}
+
+export const Route = createFileRoute("/api")({
+    server: {
+        handlers: {
+            // Health check: open https://a.hpbooks.uk/api in the browser
+            GET: async () => json({ ok: true, hasDb: !!process.env["DATABASE_URL"] }),
+
+            POST: async ({ request }) => {
+                const url = new URL(request.url);
+                const action = url.searchParams.get("action");
+
+                const dbUrl = process.env["DATABASE_URL"];
+                if (!dbUrl) return fail(500, "server", "Database configuration missing");
+                const sql: any = neon(dbUrl);
+
+                let body: any;
+                try {
+                    body = await request.json();
+                } catch {
+                    return fail(400, "bad_request", "Invalid JSON body");
+                }
+
+                try {
+                    /* ------------------------------ CREATE ------------------------------ */
+                    if (action === "create") {
+                        const hostId = body.hostId;
+                        const name = cleanName(body.hostName);
+                        const maxPlayers = Math.round(Number(body.maxPlayers));
+                        if (!validId(hostId)) return fail(400, "bad_request", "Missing player id.");
+                        if (!name) return fail(400, "bad_name", "Pick a name so your friends know who you are.");
+                        if (!(maxPlayers >= 2 && maxPlayers <= 4))
+                            return fail(400, "bad_request", "Rooms hold between 2 and 4 players.");
+
+                        await leaveEverywhere(sql, hostId);
+                        await sweepAbandoned(sql);
+
+                        for (let i = 0; i < 6; i++) {
+                            const code = makeCode();
+                            try {
+                                // Room + host seat in ONE statement, so a room can never exist without its host.
+                                const made = rows<{ room_id: Id }>(
+                                    await sql`
+                    WITH r AS (
+                      INSERT INTO cardi_rooms (room_code, host_id, status, max_players)
+                      VALUES (${code}, ${hostId}, 'waiting', ${maxPlayers})
+                      RETURNING id
+                    )
+                    INSERT INTO cardi_room_players (room_id, user_id, player_name, seat_index, last_seen)
+                    SELECT id, ${hostId}, ${name}, 0, now() FROM r
+                    RETURNING room_id`,
+                                );
+                                return json({
+                                    success: true,
+                                    roomId: made[0]?.room_id,
+                                    roomCode: code,
+                                    maxPlayers,
+                                    seatIndex: 0,
+                                });
+                            } catch (e: any) {
+                                if (e.code === "23505" && String(e.detail ?? "").includes("room_code")) continue;
+                                throw e;
+                            }
+                        }
+                        return fail(503, "busy", "Couldn't allocate a room code. Please try again.");
+                    }
+
+                    /* ------------------------------- JOIN ------------------------------- */
+                    if (action === "join") {
+                        const roomCode = normCode(body.roomCode);
+                        const userId = body.userId;
+                        const name = cleanName(body.playerName);
+                        if (roomCode.length !== 6) return fail(400, "bad_code", "Room codes have 6 characters.");
+                        if (!validId(userId)) return fail(400, "bad_request", "Missing player id.");
+                        if (!name) return fail(400, "bad_name", "Pick a name so your friends know who you are.");
+
+                        const room = await findRoom(sql, roomCode);
+                        if (!room) return fail(404, "not_found", MSG_NOT_FOUND);
+                        if (room.status === "waiting" && !(await pruneRoom(sql, room.id)))
+                            return fail(404, "not_found", MSG_NOT_FOUND);
+                        const maxPlayers = room.max_players ?? 4;
+
+                        // Already seated here (double tap / reconnect): just refresh.
+                        const existing = rows<{ seat_index: number }>(
+                            await sql`SELECT seat_index FROM cardi_room_players WHERE room_id = ${room.id} AND user_id = ${userId}`,
+                        )[0];
+                        if (existing) {
+                            await sql`UPDATE cardi_room_players SET player_name = ${name}, last_seen = now()
+                        WHERE room_id = ${room.id} AND user_id = ${userId}`;
+                            return json({ success: true, roomId: room.id, roomCode, seatIndex: existing.seat_index, maxPlayers });
+                        }
+
+                        if (room.status !== "waiting")
+                            return fail(409, "started", "That game has already started.");
+
+                        await leaveEverywhere(sql, userId, room.id);
+
+                        const taken = rows<{ x: number }>(
+                            await sql`SELECT 1 AS x FROM cardi_room_players
+                        WHERE room_id = ${room.id} AND lower(player_name) = lower(${name})`,
+                        );
+                        if (taken.length > 0)
+                            return fail(409, "name_taken", "Someone in that room already uses that name. Try another one.");
+
+                        let seat = -1;
+                        for (let attempt = 0; attempt < 3 && seat < 0; attempt++) {
+                            const free = rows<{ s: number }>(
+                                await sql`
+                  SELECT s FROM generate_series(0, ${maxPlayers} - 1) AS s
+                  WHERE s NOT IN (SELECT seat_index FROM cardi_room_players WHERE room_id = ${room.id})
+                  ORDER BY s LIMIT 1`,
+                            )[0];
+                            if (!free) break;
+                            try {
+                                await sql`
+                  INSERT INTO cardi_room_players (room_id, user_id, player_name, seat_index, last_seen)
+                  VALUES (${room.id}, ${userId}, ${name}, ${free.s}, now())`;
+                                seat = free.s;
+                            } catch (e: any) {
+                                if (e.code !== "23505") throw e; // seat grabbed by someone else a moment ago: retry
+                            }
+                        }
+                        if (seat < 0) return fail(409, "full", "That room is already full.");
+
+                        const count =
+                            rows<{ n: number }>(
+                                await sql`SELECT COUNT(*)::int AS n FROM cardi_room_players WHERE room_id = ${room.id}`,
+                            )[0]?.n ?? 0;
+                        if (count >= maxPlayers) {
+                            // Last seat filled: flip to playing and give everybody the same shuffle seed.
+                            await sql`UPDATE cardi_rooms
+                        SET status = 'playing', seed = ${Math.floor(Math.random() * 2147483646) + 1}
+                        WHERE id = ${room.id} AND status = 'waiting'`;
+                        }
+                        return json({ success: true, roomId: room.id, roomCode, seatIndex: seat, maxPlayers });
+                    }
+
+                    /* ------------------------------ STATUS ------------------------------ */
+                    if (action === "status") {
+                        const roomCode = normCode(body.roomCode);
+                        const userId = body.userId;
+                        if (roomCode.length !== 6 || !validId(userId)) return fail(400, "bad_request", "Bad request.");
+
+                        const room = await findRoom(sql, roomCode);
+                        if (!room) return json({ closed: true, reason: "not_found" });
+
+                        // Heartbeat first, so a slow tab is never pruned by its own request.
+                        const beat = rows<{ x: number }>(
+                            await sql`UPDATE cardi_room_players SET last_seen = now()
+                        WHERE room_id = ${room.id} AND user_id = ${userId} RETURNING 1 AS x`,
+                        );
+                        if (beat.length === 0) return json({ closed: true, reason: "removed" });
+
+                        if (room.status === "waiting" && !(await pruneRoom(sql, room.id)))
+                            return json({ closed: true, reason: "host_left" });
+
+                        const players = rows<{ seat_index: number; player_name: string; is_host: boolean; is_you: boolean }>(
+                            await sql`
+                SELECT p.seat_index, p.player_name,
+                       (p.user_id = r.host_id) AS is_host,
+                       (p.user_id = ${userId}) AS is_you
+                FROM cardi_room_players p
+                JOIN cardi_rooms r ON r.id = p.room_id
+                WHERE p.room_id = ${room.id}
+                ORDER BY p.seat_index`,
+                        );
+                        if (!players.some((p) => p.is_you)) return json({ closed: true, reason: "removed" });
+
+                        return json({
+                            closed: false,
+                            status: room.status,
+                            maxPlayers: room.max_players ?? 4,
+                            seed: room.seed == null ? null : Number(room.seed),
+                            players: players.map((p) => ({
+                                seat: p.seat_index,
+                                name: p.player_name,
+                                isHost: p.is_host,
+                                isYou: p.is_you,
+                            })),
+                        });
+                    }
+
+                    /* ------------------------------- LEAVE ------------------------------ */
+                    if (action === "leave") {
+                        const roomCode = normCode(body.roomCode);
+                        const userId = body.userId;
+                        if (roomCode.length !== 6 || !validId(userId)) return json({ success: true });
+
+                        const room = await findRoom(sql, roomCode);
+                        if (room && room.status === "waiting") {
+                            const isHost =
+                                rows<{ x: number }>(
+                                    await sql`SELECT 1 AS x FROM cardi_rooms WHERE id = ${room.id} AND host_id = ${userId}`,
+                                ).length > 0;
+                            if (isHost) await destroyRoom(sql, room.id); // host leaves => room closes for everyone
+                            else await sql`DELETE FROM cardi_room_players WHERE room_id = ${room.id} AND user_id = ${userId}`;
+                        }
+                        return json({ success: true });
+                    }
+
+                    return fail(400, "bad_request", "Invalid action");
+                } catch (error: any) {
+                    console.error("API Error:", error);
+                    return fail(500, "server", error?.message ?? "Server error");
+                }
+            },
+        },
+    },
+});

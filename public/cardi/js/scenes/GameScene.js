@@ -105,7 +105,13 @@ class GameScene extends Phaser.Scene {
       { name: this.options.botName, isBot: true },
     ];
     this.humanIndex = this.options.localIndex || 0;
-    this.state = GameStateMgr.createGame(roster);
+    // Online rooms pass a shared seed so every player gets the exact same shuffle.
+    let rng;
+    if (this.options.seed != null) {
+      let a = (Number(this.options.seed) >>> 0) || 1;
+      rng = () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+    }
+    this.state = GameStateMgr.createGame(roster, rng);
     this.vw = { human: [], discard: [], discardCount: 0, drawCount: 0, suit: this.state.currentSuit, suitShown: null };
     this.lastDirection = this.state.direction;
 
