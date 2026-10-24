@@ -557,7 +557,15 @@ const CardiOnline = {
         if (s.key !== key) { paintSlot(s, i, p || null, !!p && !state.first); s.key = key; }
       });
       if (!state.first) {
-        d.players.forEach((p) => { if (!p.isYou && state.prev[p.seat] !== p.name) MK.toast(scene, p.name + ' joined'); });
+        d.players.forEach((p) => {
+          if (!p.isYou && state.prev[p.seat] !== p.name) {
+            MK.toast(scene, p.name + ' joined');
+            // PLAY JOIN SOUND
+            if (scene.cache.audio.exists('sfx_join')) {
+              scene.sound.play('sfx_join', { volume: 0.8 });
+            }
+          }
+        });
         Object.keys(state.prev).forEach((seat) => { if (!now[seat]) MK.toast(scene, state.prev[seat] + ' left'); });
       }
       state.prev = now; state.first = false;
@@ -723,6 +731,7 @@ class MainMenuScene extends Phaser.Scene {
     if (this.cache.audio.exists('menu_music')) return ready();
     this.load.once('filecomplete-audio-menu_music', ready);
     this.load.audio('menu_music', MK.BASE + 'assets/bg.mp3');
+    this.load.audio('sfx_join', MK.BASE + 'assets/jd.wav');
     this.load.start();
   }
 
@@ -760,10 +769,13 @@ class MainMenuScene extends Phaser.Scene {
 
   /** Start an online match: same fade-out as a local game, then hand the roster + shared seed to GameScene. */
   launchOnline(data) {
-    const go = () => this.scene.start('GameScene', data);
-    if (this.menuMusic && this.menuMusic.isPlaying) {
-      this.tweens.add({ targets: this.menuMusic, volume: 0, duration: 500, onComplete: () => { this.menuMusic.stop(); this.menuMusic.destroy(); this.menuMusic = null; go(); } });
-    } else go();
+    // Instantly stop music and transition so the host's deal animation doesn't freeze
+    if (this.menuMusic) {
+      this.menuMusic.stop();
+      this.menuMusic.destroy();
+      this.menuMusic = null;
+    }
+    this.scene.start('GameScene', data);
   }
 
   showSocial() {

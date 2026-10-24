@@ -65,17 +65,15 @@ class GameScene extends Phaser.Scene {
   }
 
   create() {
-    // Unlock the browser's audio context on the first click
     this.input.once('pointerdown', () => {
       if (this.sound.context && this.sound.context.state === 'suspended') this.sound.context.resume();
     });
-    // Sound is ALWAYS on when a game starts (the mute switch lives in the pause menu)
     this.muted = false;
     try { this.sound.mute = false; } catch (e) { /* ignore */ }
 
     this.dead = false;
     this.paused = false;
-    this.clock = 0;                 // game time in ms (does not advance while paused)
+    this.clock = 0;
     this.busy = true;
     this.dealing = true;
     this.modal = null;
@@ -91,7 +89,7 @@ class GameScene extends Phaser.Scene {
     this.pauseTweens = [];
     this.passTimer = null;
     this.passTimerRing = null;
-    this.popQ = [];                 // pop-up lane (see queuePopup)
+    this.popQ = [];
     this.popBusy = false;
     this.popLive = 0;
     this.popMax = 0;
@@ -105,7 +103,8 @@ class GameScene extends Phaser.Scene {
       { name: this.options.botName, isBot: true },
     ];
     this.humanIndex = this.options.localIndex || 0;
-    // Online rooms pass a shared seed so every player gets the exact same shuffle.
+    this.isHost = this.humanIndex === 0;
+
     let rng;
     if (this.options.seed != null) {
       let a = (Number(this.options.seed) >>> 0) || 1;
@@ -127,20 +126,47 @@ class GameScene extends Phaser.Scene {
     this.input.on('pointerup', this.onPtrUp, this);
     this.input.on('wheel', this.onWheel, this);
     if (this.input.keyboard) this.input.keyboard.on('keydown-ESC', this.onEsc, this);
+
+    // --- SUPABASE REALTIME SYNC ---
+    if (this.options.online && window.CARDI_CONFIG) {
+      const supabaseUrl = window.CARDI_CONFIG.supabaseUrl;
+      const supabaseKey = window.CARDI_CONFIG.supabaseKey;
+
+      if (supabaseUrl && supabaseKey) {
+        const supabase = window.supabase.createClient(supabaseUrl, supabaseKey);
+        this.channel = supabase.channel('room:' + this.options.online.roomCode);
+
+        this.channel
+          .on('broadcast', { event: 'intent_play' }, async (payload) => {
+            if (this.isHost) {
+              this.busy = false;
+              await this.perform(payload.payload.move);
+            }
+          })
+          .on('broadcast', { event: 'state_update' }, (payload) => {
+            if (!this.isHost) {
+              this.state = payload.payload.state;
+              this.busy = false;
+              this.render();
+              this.advance();
+            }
+          })
+          .subscribe();
+      }
+    }
+    // -----------------------------
+
     this.events.once('shutdown', () => {
       this.dead = true;
       this.input.off('pointermove', this.onPtrMove, this);
       this.input.off('pointerup', this.onPtrUp, this);
       this.input.off('wheel', this.onWheel, this);
       if (this.input.keyboard) this.input.keyboard.off('keydown-ESC', this.onEsc, this);
+      if (this.channel) this.channel.unsubscribe();
     });
 
-    // --- WAKE LISTENER ---
-    // When Settings closes and wakes the game, make sure we are still paused safely
     this.events.on('wake', () => {
-      if (this.paused) {
-        this.time.paused = true;
-      }
+      if (this.paused) this.time.paused = true;
     });
 
     this.startDealSequence();
@@ -1322,6 +1348,22 @@ class GameScene extends Phaser.Scene {
 
   async perform(move) {
     if (this.busy) return;
+
+    // GUEST: Send intent to host
+    if (this.options.online && !this.isHost) {
+      this.busy = true;
+      this.showToast('Sending move...', '#cfe3d8');
+      if (this.channel) {
+        this.channel.send({
+          type: 'broadcast',
+          event: 'intent_play',
+          payload: { playerIndex: this.humanIndex, move: move }
+        });
+      }
+      return;
+    }
+
+    // HOST (or offline): Run the engine
     let next;
     try {
       next = Rules.applyMove(this.state, move);
@@ -1330,17 +1372,30 @@ class GameScene extends Phaser.Scene {
       this.showToast(e.message, '#ff6b6b', 536);
       return;
     }
+
     const mover = this.state.currentPlayerIndex;
     this.clearPassTimer();
     this.busy = true;
     this.clearToasts();
     this.render();
+
     if (move.type === 'pass') this.seatAction(mover, 'Passed');
     await this.playEvents(next.events);
     if (!this.alive()) return;
+
     this.state = next;
     this.busy = false;
     this.render();
+
+    // HOST: Broadcast new state to everyone
+    if (this.options.online && this.isHost && this.channel) {
+      this.channel.send({
+        type: 'broadcast',
+        event: 'state_update',
+        payload: { state: this.state }
+      });
+    }
+
     this.advance();
   }
 
