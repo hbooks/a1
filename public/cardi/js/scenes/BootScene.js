@@ -7,12 +7,11 @@ class BootScene extends Phaser.Scene {
   }
 
   preload() {
-    // Get the actual screen center
     const cx = this.scale.width / 2;
     const cy = this.scale.height / 2;
 
     // 1. The Centered Pulsing Text
-    const loadText = this.add.text(cx, cy - 30, 'Loading Assets...', {
+    this.loadText = this.add.text(cx, cy - 30, 'Loading Assets...', {
       fontFamily: UI.FONT,
       fontSize: '28px',
       fontStyle: '900',
@@ -20,9 +19,9 @@ class BootScene extends Phaser.Scene {
       shadow: { offsetX: 0, offsetY: 4, color: '#000', blur: 8, fill: true }
     }).setOrigin(0.5);
 
-    // Pulse animation for the text
+    // Pulse animation
     this.tweens.add({
-      targets: loadText,
+      targets: this.loadText,
       scale: 1.08,
       alpha: 0.7,
       duration: 800,
@@ -31,41 +30,38 @@ class BootScene extends Phaser.Scene {
       ease: 'Sine.inOut'
     });
 
-    // 2. The Progress Bar (Directly under the text)
+    // 2. The Progress Bar
     const barWidth = 240;
     const barY = cy + 20;
 
-    const barBg = this.add.graphics();
-    const barFill = this.add.graphics();
+    this.barBg = this.add.graphics();
+    this.barFill = this.add.graphics();
 
-    // Background track
-    barBg.fillStyle(0x000000, 0.5).fillRoundedRect(cx - barWidth / 2, barY, barWidth, 10, 5);
-    barBg.lineStyle(2, 0x2e5242, 1).strokeRoundedRect(cx - barWidth / 2, barY, barWidth, 10, 5);
+    this.barBg.fillStyle(0x000000, 0.5).fillRoundedRect(cx - barWidth / 2, barY, barWidth, 10, 5);
+    this.barBg.lineStyle(2, 0x2e5242, 1).strokeRoundedRect(cx - barWidth / 2, barY, barWidth, 10, 5);
 
-    // 3. Fetch Secure Config (Invisible to user, happens in background)
+    // 3. Fetch Secure Config
     this.fetchConfig();
 
-    // 4. Update Progress Bar & Load Assets
+    // 4. Load Assets
     this.load.on('progress', (v) => {
-      barFill.clear();
+      this.barFill.clear();
       if (v > 0) {
-        barFill.fillStyle(0xe8b923, 1).fillRoundedRect(cx - barWidth / 2, barY, Math.max(10, barWidth * v), 10, 5);
+        this.barFill.fillStyle(0xe8b923, 1).fillRoundedRect(cx - barWidth / 2, barY, Math.max(10, barWidth * v), 10, 5);
       }
     });
 
     this.load.on('complete', () => {
-      loadText.setText('Ready!');
-      // Brief pause before transitioning
+      this.loadText.setText('Ready!');
       this.time.delayedCall(300, () => {
         this.cameras.main.fadeOut(400, 15, 36, 28);
         this.cameras.main.once('camerafadeoutcomplete', () => this.scene.start('MainMenuScene'));
       });
     });
 
-    // Load sounds
     this.load.audio('sfx_click', MK.BASE + 'assets/ck.wav');
+    this.load.audio('sfx_join', MK.BASE + 'assets/jd.m4a');
 
-    // Load card art if it exists
     if (window.CARDI_CARD_ART) {
       this.load.setPath(MK.BASE + 'assets/cards/');
       Rules.createDeck().forEach((c) => this.load.image(c.id, `${c.id}.png`));
@@ -73,46 +69,40 @@ class BootScene extends Phaser.Scene {
     }
   }
 
-  async fetchConfig(statusText) {
+  async fetchConfig() {
     try {
       const res = await fetch('/config', {
-        method: 'GET',
-        headers: {
-          'x-cardi-client': 'true' // Tell the server we are the game
-        }
+        headers: { 'x-cardi-client': 'true' }
       });
 
       if (res.ok) {
         const contentType = res.headers.get("content-type");
-
-        // Make sure we actually got JSON back, not just a text "OK"
         if (contentType && contentType.includes("application/json")) {
           window.CARDI_CONFIG = await res.json();
-          if (window.CARDI_CONFIG.supabaseUrl) {
-            statusText.setText('Secure connection established');
-          } else {
-            statusText.setText('Warning: Supabase keys missing in env');
+
+          // Safely update text only if the scene and text object still exist
+          if (this.scene.isActive() && this.loadText) {
+            if (window.CARDI_CONFIG.supabaseUrl) {
+              this.loadText.setText('Secure connection established');
+            } else {
+              this.loadText.setText('Warning: Supabase keys missing');
+            }
           }
-        } else {
-          statusText.setText('Server returned invalid config format');
         }
-      } else {
-        statusText.setText('Failed to load config');
       }
     } catch (e) {
       console.warn('Could not load secure config', e);
-      statusText.setText('Offline mode');
     }
   }
 
   create() {
-    // Generate fallback card textures if the images failed to load
+    // Generate fallback cards
     Rules.createDeck().forEach((c) => {
       if (!this.textures.exists(c.id)) this.makeCardTexture(c);
     });
     if (!this.textures.exists('card_back')) this.makeBackTexture();
 
-    // Load volume and mute settings
+    // Load settings
     const v = localStorage.getItem('cardi_vol');
     if (v !== null) this.sound.volume = parseFloat(v);
     this.sound.mute = localStorage.getItem('cardi_mute') === '1';

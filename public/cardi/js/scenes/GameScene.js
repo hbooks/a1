@@ -129,15 +129,18 @@ class GameScene extends Phaser.Scene {
 
     // --- SUPABASE REALTIME SYNC ---
     if (this.options.online && window.CARDI_CONFIG) {
+      this.isHost = this.humanIndex === 0;
+
       const supabaseUrl = window.CARDI_CONFIG.supabaseUrl;
       const supabaseKey = window.CARDI_CONFIG.supabaseKey;
 
       if (supabaseUrl && supabaseKey) {
         const supabase = window.supabase.createClient(supabaseUrl, supabaseKey);
+
         this.channel = supabase.channel('room:' + this.options.online.roomCode, {
           config: {
-            broadcast: { self: true }, // Allows the sender to receive their own messages (useful for testing)
-            private: false             // <--- THIS IS THE CRITICAL FIX
+            broadcast: { self: true },
+            private: false
           }
         });
 
@@ -1354,7 +1357,7 @@ class GameScene extends Phaser.Scene {
   async perform(move) {
     if (this.busy) return;
 
-    // GUEST: Send intent to host
+    // 1. GUEST: Send move to Host via Supabase
     if (this.options.online && !this.isHost) {
       this.busy = true;
       this.showToast('Sending move...', '#cfe3d8');
@@ -1368,7 +1371,7 @@ class GameScene extends Phaser.Scene {
       return;
     }
 
-    // HOST (or offline): Run the engine
+    // 2. HOST (or offline): Run the local engine
     let next;
     try {
       next = Rules.applyMove(this.state, move);
@@ -1392,7 +1395,7 @@ class GameScene extends Phaser.Scene {
     this.busy = false;
     this.render();
 
-    // HOST: Broadcast new state to everyone
+    // 3. HOST: Broadcast the new state to the Guest
     if (this.options.online && this.isHost && this.channel) {
       this.channel.send({
         type: 'broadcast',

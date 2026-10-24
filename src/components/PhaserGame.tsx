@@ -2,10 +2,11 @@ import { useEffect, useRef, useState } from "react";
 
 const BASE = "/cardi/";
 const PHASER_URL = "https://cdn.jsdelivr.net/npm/phaser@3.80.1/dist/phaser.min.js";
-// Cache-buster for the game scripts. Dev: changes on every full page load. Prod: bump VITE_CARDI_BUILD per deploy.
-// Kept on window so React hot-reload never re-executes already-loaded scripts (that would redeclare their classes).
+const SUPABASE_URL = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2";
+
+// Cache-buster for the game scripts
 const BUILD: string = (() => {
-    if (typeof window === "undefined") return "1"; // server render: no window
+    if (typeof window === "undefined") return "1";
     const w = window as any;
     if (!w.__CARDI_BUILD__) {
         const env = (import.meta as any).env;
@@ -13,6 +14,7 @@ const BUILD: string = (() => {
     }
     return w.__CARDI_BUILD__ as string;
 })();
+
 const SCRIPTS = [
     "js/ui.js", "js/names.js", "js/rules.js", "js/gameState.js", "js/bot.js",
     "js/scenes/BootScene.js", "js/scenes/MainMenuScene.js", "js/scenes/GameScene.js",
@@ -42,7 +44,7 @@ const loadScript = (src: string, timeout = 15000) =>
     new Promise<void>((resolve, reject) => {
         const old = document.querySelector(`script[src="${src}"]`) as HTMLScriptElement | null;
         if (old?.dataset["loaded"] === "1") return resolve();
-        old?.remove(); // a stale/failed tag must never block a retry
+        old?.remove();
         const s = document.createElement("script");
         s.src = src;
         s.async = false;
@@ -62,7 +64,6 @@ const loadWithRetry = async (src: string, tries = 3) => {
     }
 };
 
-/** Parallel download, ordered execution (async=false). Falls back to slow ordered retries if any fails. */
 const loadAll = async () => {
     try { await Promise.all(SCRIPTS.map((src) => loadScript(src))); }
     catch { for (const src of SCRIPTS) await loadWithRetry(src); }
@@ -77,7 +78,6 @@ export default function PhaserGame() {
     const phaseRef = useRef<Phase>("loading");
     phaseRef.current = phase;
 
-    // Track connection live: auto-retry when it comes back, warn if it drops mid-game.
     useEffect(() => {
         const up = () => {
             setOnline(true);
@@ -102,6 +102,8 @@ export default function PhaserGame() {
         (async () => {
             try {
                 if (!(window as any).Phaser) await loadWithRetry(PHASER_URL);
+                if (!(window as any).supabase) await loadWithRetry(SUPABASE_URL);
+
                 await loadAll();
                 if (cancelled) return;
                 await Promise.race([(window as any).fontsReady, new Promise((r) => setTimeout(r, 4000))]);
@@ -111,7 +113,7 @@ export default function PhaserGame() {
                 game = new (window as any).Phaser.Game({ ...(window as any).CardiConfig, parent: containerRef.current });
                 const show = () => !cancelled && setPhase("ready");
                 game.events.once("ready", show);
-                timers.push(setTimeout(show, 4000)); // safety net
+                timers.push(setTimeout(show, 4000));
             } catch (err) {
                 console.error("Cardi failed to load", err);
                 if (!cancelled) setPhase(navigator.onLine ? "error" : "offline");
@@ -132,11 +134,10 @@ export default function PhaserGame() {
         <div className="relative w-full h-dvh overflow-hidden bg-[#0f241c] select-none"
             style={{ paddingTop: "env(safe-area-inset-top)", paddingBottom: "env(safe-area-inset-bottom)" }}>
             <style>{CSS}</style>
-            {/* Phaser fills everything; Scale.FIT handles the aspect ratio */}
+
             <div ref={containerRef} className="absolute"
                 style={{ inset: "env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)" }} />
 
-            {/* Connection lost mid-game: non-blocking */}
             {phase === "ready" && !online && (
                 <div className="absolute top-3 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2 rounded-full bg-[#e8b923] px-4 py-2 text-sm font-bold text-[#241900] shadow-lg">
                     <span className="h-2 w-2 animate-pulse rounded-full bg-[#241900]" />
@@ -144,7 +145,6 @@ export default function PhaserGame() {
                 </div>
             )}
 
-            {/* Full loader / offline / error screen. Never a blank screen. */}
             <div
                 className="absolute inset-0 z-50 flex flex-col items-center justify-center gap-6 bg-[#0f241c] px-6 text-center transition-opacity duration-500"
                 style={{ background: "radial-gradient(ellipse at center,#1d4333 0%,#0f241c 70%)", opacity: covered ? 1 : 0, pointerEvents: covered ? "auto" : "none" }}
