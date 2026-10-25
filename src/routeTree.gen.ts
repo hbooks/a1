@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ApiRouteImport } from './routes/api'
+import { Route as CleanupRouteImport } from './routes/cleanup'
 import { Route as ConfigRouteImport } from './routes/config'
 
 const IndexRoute = IndexRouteImport.update({
@@ -23,6 +24,11 @@ const ApiRoute = ApiRouteImport.update({
   path: '/api',
   getParentRoute: () => rootRouteImport,
 } as any)
+const CleanupRoute = CleanupRouteImport.update({
+  id: '/cleanup',
+  path: '/cleanup',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ConfigRoute = ConfigRouteImport.update({
   id: '/config',
   path: '/config',
@@ -32,30 +38,34 @@ const ConfigRoute = ConfigRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/api': typeof ApiRoute
+  '/cleanup': typeof CleanupRoute
   '/config': typeof ConfigRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/api': typeof ApiRoute
+  '/cleanup': typeof CleanupRoute
   '/config': typeof ConfigRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/api': typeof ApiRoute
+  '/cleanup': typeof CleanupRoute
   '/config': typeof ConfigRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/api' | '/config'
+  fullPaths: '/' | '/api' | '/cleanup' | '/config'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/api' | '/config'
-  id: '__root__' | '/' | '/api' | '/config'
+  to: '/' | '/api' | '/cleanup' | '/config'
+  id: '__root__' | '/' | '/api' | '/cleanup' | '/config'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ApiRoute: typeof ApiRoute
+  CleanupRoute: typeof CleanupRoute
   ConfigRoute: typeof ConfigRoute
 }
 
@@ -75,6 +85,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/cleanup': {
+      id: '/cleanup'
+      path: '/cleanup'
+      fullPath: '/cleanup'
+      preLoaderRoute: typeof CleanupRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/config': {
       id: '/config'
       path: '/config'
@@ -88,6 +105,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ApiRoute: ApiRoute,
+  CleanupRoute: CleanupRoute,
   ConfigRoute: ConfigRoute,
 }
 export const routeTree = rootRouteImport
