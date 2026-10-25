@@ -24,7 +24,6 @@ out/
 .vercel/
 .netlify/
 .netlify-cache/
-.wrangler/
 .turbo/
 *.tsbuildinfo
 
@@ -123,6 +122,54 @@ wrangler.toml.bak
 worker-configuration.d.ts
 
 # ─────────────────────────────────────────────
+# PWA / Service Worker Notes
+# ─────────────────────────────────────────────
+# We DO commit manifest.json, sw.js, and /icons/ because they are 
+# needed for the app to install and run offline.
+# However, if you build a generated service worker (e.g., via Workbox), 
+# ignore the generated file here:
+# sw-generated.js
+# workbox-*.js
+manifest.json
+sw.js
+icons/
+
+# ─────────────────────────────────────────────
+# Android / TWA (Trusted Web Activity) / Bubblewrap
+# ─────────────────────────────────────────────
+# Bubblewrap generates an Android project. NEVER commit keystores.
+*.keystore
+*.jks
+keystore.properties
+
+# Generated Android build folders
+android/
+app/
+gradle/
+gradlew
+gradlew.bat
+local.properties
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Bubblewrap-specific / TWA config (contains signing info)
+assetlinks.json  # <--- DO NOT commit this, it contains your SHA-256 fingerprint
+twa-manifest.json
+
+# Built output files (APK / AAB)
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+bin/
+gen/
+out/
+
+# ─────────────────────────────────────────────
 # Phaser / Game assets (temporary)
 # ─────────────────────────────────────────────
 # Keep this commented until you actually have huge generated art
@@ -142,8 +189,3 @@ temp/
 *.bak
 *.orig
 *.rej
-
-// ─────────────────────────────────────────────
-# other
-// ─────────────────────────────────────────────
-.wrangler/
