@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { neon } from "@neondatabase/serverless";
+import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
 
 /**
  * Cardi rooms API  (POST /api?action=create | join | status | leave)
@@ -15,7 +15,7 @@ import { neon } from "@neondatabase/serverless";
  * Run cardi_migration.sql in Neon once before using this file.
  */
 
-type Sql = ReturnType<typeof neon>;
+type Sql = NeonQueryFunction<false, false>; // exactly what neon(url) returns
 type Id = string | number;
 type RoomRow = { id: Id; status: string; max_players: number | null; seed: string | number | null };
 
@@ -50,6 +50,7 @@ async function findRoom(sql: Sql, code: string): Promise<RoomRow | undefined> {
 }
 
 async function destroyRoom(sql: Sql, roomId: Id) {
+    await sql`DELETE FROM cardi_moves WHERE room_code = (SELECT room_code FROM cardi_rooms WHERE id = ${roomId})`;
     await sql`DELETE FROM cardi_room_players WHERE room_id = ${roomId}`;
     await sql`DELETE FROM cardi_rooms WHERE id = ${roomId}`;
 }
@@ -99,6 +100,7 @@ async function leaveEverywhere(sql: Sql, userId: string, exceptRoomId?: Id) {
 
 /** Waiting rooms nobody has touched for a long time (closed tabs) are removed. */
 async function sweepAbandoned(sql: Sql) {
+    await sql`DELETE FROM cardi_moves WHERE created_at < now() - interval '1 day'`;
     await sql`
     DELETE FROM cardi_room_players
     WHERE room_id IN (
@@ -123,7 +125,7 @@ export const Route = createFileRoute("/api")({
 
                 const dbUrl = process.env["DATABASE_URL"];
                 if (!dbUrl) return fail(500, "server", "Database configuration missing");
-                const sql: any = neon(dbUrl);
+                const sql = neon(dbUrl);
 
                 let body: any;
                 try {
@@ -307,6 +309,71 @@ export const Route = createFileRoute("/api")({
                             else await sql`DELETE FROM cardi_room_players WHERE room_id = ${room.id} AND user_id = ${userId}`;
                         }
                         return json({ success: true });
+                    }
+
+                    /* -------------------- MOVE LOG (the shared game) -------------------- */
+                    // Every action in a match is one row with the next sequence number. The primary key
+                    // (room_code, seq) guarantees exactly one winner when two devices send at the same moment.
+                    if (action === "move") {
+                        const roomCode = normCode(body.roomCode);
+                        const userId = body.userId;
+                        const seq = Math.floor(Number(body.seq));
+                        const mv = body.move;
+                        if (roomCode.length !== 6 || !validId(userId)) return fail(400, "bad_request", "Bad request.");
+                        if (!(seq >= 1 && seq < 100000)) return fail(400, "bad_request", "Bad sequence number.");
+                        if (!mv || typeof mv !== "object" || !["play", "draw", "pass", "declare", "start"].includes(mv.type))
+                            return fail(400, "bad_request", "Unknown move.");
+                        const text = JSON.stringify(mv);
+                        if (text.length > 4000) return fail(400, "bad_request", "Move too large.");
+
+                        const me = rows<{ seat_index: number; status: string }>(
+                            await sql`
+                SELECT p.seat_index, r.status
+                FROM cardi_room_players p JOIN cardi_rooms r ON r.id = p.room_id
+                WHERE r.room_code = ${roomCode} AND p.user_id = ${userId}`,
+                        )[0];
+                        if (!me || me.status !== "playing") return fail(403, "not_in_game", "You are not in this game.");
+
+                        let accepted = false;
+                        try {
+                            const ins = rows<{ seq: number }>(
+                                await sql`
+                  INSERT INTO cardi_moves (room_code, seq, player_index, payload)
+                  SELECT ${roomCode}::text, ${seq}::int, ${me.seat_index}::int, ${text}::jsonb
+                  WHERE ${seq}::int = COALESCE((SELECT MAX(m.seq) FROM cardi_moves m WHERE m.room_code = ${roomCode}::text), 0) + 1
+                  RETURNING seq`,
+                            );
+                            accepted = ins.length > 0;
+                        } catch (e: any) {
+                            if (e.code !== "23505") throw e; // someone else took this number a moment ago
+                        }
+                        // Always answer with the log from this number on (ours if accepted, the winner's if not).
+                        const moves = rows<{ seq: number; player_index: number; payload: unknown }>(
+                            await sql`SELECT seq, player_index, payload FROM cardi_moves
+                        WHERE room_code = ${roomCode}::text AND seq >= ${seq}::int ORDER BY seq LIMIT 200`,
+                        );
+                        return json({
+                            accepted,
+                            moves: moves.map((m) => ({ seq: m.seq, player: m.player_index, move: m.payload })),
+                        });
+                    }
+
+                    if (action === "events") {
+                        const roomCode = normCode(body.roomCode);
+                        const userId = body.userId;
+                        const since = Math.max(0, Math.floor(Number(body.since)) || 0);
+                        if (roomCode.length !== 6 || !validId(userId)) return fail(400, "bad_request", "Bad request.");
+                        const moves = rows<{ seq: number; player_index: number; payload: unknown }>(
+                            await sql`
+                SELECT m.seq, m.player_index, m.payload
+                FROM cardi_moves m
+                WHERE m.room_code = ${roomCode}::text AND m.seq > ${since}::int
+                  AND EXISTS (
+                    SELECT 1 FROM cardi_room_players p JOIN cardi_rooms r ON r.id = p.room_id
+                    WHERE r.room_code = ${roomCode}::text AND p.user_id = ${userId})
+                ORDER BY m.seq LIMIT 200`,
+                        );
+                        return json({ moves: moves.map((m) => ({ seq: m.seq, player: m.player_index, move: m.payload })) });
                     }
 
                     return fail(400, "bad_request", "Invalid action");

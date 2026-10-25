@@ -127,7 +127,7 @@ class GameScene extends Phaser.Scene {
     this.input.on('wheel', this.onWheel, this);
     if (this.input.keyboard) this.input.keyboard.on('keydown-ESC', this.onEsc, this);
 
-    // Online rooms: host runs the rules, everyone else mirrors it (see the ONLINE SYNC section below).
+    // Online rooms: no host. Everybody replays the same ordered move log (see ONLINE section below).
     this.initOnline();
 
     this.events.once('shutdown', () => {
@@ -136,8 +136,7 @@ class GameScene extends Phaser.Scene {
       this.input.off('pointerup', this.onPtrUp, this);
       this.input.off('wheel', this.onWheel, this);
       if (this.input.keyboard) this.input.keyboard.off('keydown-ESC', this.onEsc, this);
-      clearInterval(this.syncIv); clearTimeout(this.wd);
-      if (this.sb && this.channel) { try { this.sb.removeChannel(this.channel); } catch (e) { /* ignore */ } }
+      this.teardownOnline();
     });
 
     this.events.on('wake', () => {
@@ -439,7 +438,6 @@ class GameScene extends Phaser.Scene {
       onComplete: () => {
         this.nikoContainer.setVisible(false);
         this.nikoWindow = null;
-        if (this.isGuest()) return; // the host decides when the window closes
         this.beginTurn(); // Foul penalty triggers here
       },
     });
@@ -1237,8 +1235,7 @@ class GameScene extends Phaser.Scene {
       return;
     }
 
-    // ONLINE GUEST: the host is the only one who starts turns. Just mirror what it sends.
-    if (this.isGuest()) { this.render(); return; }
+    if (this.options.online) { this.driveOnline(); return; }
 
     // Bots announce "Niko Cardi!" automatically when their last card is a winning one
     s.players.forEach((p, i) => {
@@ -1253,11 +1250,6 @@ class GameScene extends Phaser.Scene {
     if (!this.state.turnStarted) {
       if (Rules.canDeclareNiko(this.state, this.humanIndex)) {
         this.render();
-      } else if (this.options.online && this.state.players.some((p, i) => i !== this.humanIndex && !p.isBot && Rules.canDeclareNiko(this.state, i))) {
-        // A remote player has their Niko Cardi window open: give them the same 5 seconds (+ network grace).
-        const tok = this.turnTok = (this.turnTok || 0) + 1;
-        this.render();
-        this.remoteNikoTimer = this.time.delayedCall(5800, () => { if (this.turnTok === tok && !this.state.turnStarted) this.beginTurn(); });
       } else {
         this.time.delayedCall(300, () => this.beginTurn());
       }
@@ -1276,7 +1268,6 @@ class GameScene extends Phaser.Scene {
         this.state = next;
         this.busy = false;
         this.render();
-        this.pushState();
         this.advance();
       });
       return;
@@ -1291,7 +1282,8 @@ class GameScene extends Phaser.Scene {
   }
 
   async beginTurn() {
-    if (!this.alive() || this.isGuest() || this.state.turnStarted) return;
+    if (!this.alive()) return;
+    if (this.options.online) { this.submitMove({ type: 'start' }, true); return; }
     this.busy = true;
     const next = Rules.startTurn(this.state);
     this.nikoWindow = null;
@@ -1302,7 +1294,6 @@ class GameScene extends Phaser.Scene {
     this.state = next;
     this.busy = false;
     this.render();
-    this.pushState();
     this.advance();
   }
 
@@ -1315,7 +1306,7 @@ class GameScene extends Phaser.Scene {
     this.burstRing(this.nikoContainer.x, this.nikoContainer.y, GOLD);
     this.sfx('niko_audio', 1);
 
-    if (this.isGuest()) { this.sendIntent({ type: 'declare' }); return; }
+    if (this.options.online) { this.submitMove({ type: 'declare' }); return; }
     this.state = Rules.applyMove(this.state, { type: 'declare', playerIndex: this.humanIndex });
     this.render();
 
@@ -1333,20 +1324,16 @@ class GameScene extends Phaser.Scene {
     await this.perform(move);
   }
 
-  /** Returns true when the move was applied. fromRemote = a guest's move executed by the host. */
-  async perform(move, fromRemote = false) {
+  async perform(move) {
     if (this.busy) return false;
-
-    // ONLINE GUEST: never touch the rules. Ask the host and wait for its answer.
-    if (this.isGuest()) { this.sendIntent(move); return true; }
+    if (this.options.online) return this.submitMove(move);   // online: the move log is the only way to change the game
 
     let next;
     try {
       next = Rules.applyMove(this.state, move);
     } catch (e) {
       console.warn('Rejected move', move, e.message);
-      this.lastReject = e.message;
-      if (!fromRemote) this.showToast(e.message, '#ff6b6b', 536);
+      this.showToast(e.message, '#ff6b6b', 536);
       return false;
     }
 
@@ -1363,178 +1350,168 @@ class GameScene extends Phaser.Scene {
     this.state = next;
     this.busy = false;
     this.render();
-    this.pushState();   // online host: tell everybody what happened
     this.advance();
     return true;
   }
 
   /* ------------------------------------------------------------------ */
-  /* ONLINE SYNC  (Supabase Realtime broadcast)                          */
-  /*   Host (seat 0) = the only one running the rules.                   */
-  /*   Guests send  'intent'  {id, seq, playerIndex, move}               */
-  /*   Host sends   'state_update' {seq, state} after EVERY transition,  */
-  /*   plus a heartbeat every 3s and on 'sync_request', so a message     */
-  /*   that was missed (late join, flaky network) heals itself.          */
+  /* ONLINE: one shared, ordered MOVE LOG. No host.                      */
+  /*   - Every action (play / draw / pass / declare Niko / start turn)   */
+  /*     is a row in the database with a sequence number.                */
+  /*   - The database accepts exactly ONE row per number, so two people  */
+  /*     can never disagree about the order.                             */
+  /*   - Every device replays the same rows through the same rules, so   */
+  /*     everybody ends up with the identical table.                     */
+  /*   - Nobody is special: whoever is responsible for an automatic step */
+  /*     (start of turn, forced draw) submits it; everyone else submits  */
+  /*     the same step a few seconds later as a safety net.              */
   /* ------------------------------------------------------------------ */
-  isOnline() { return !!this.options.online; }
-  isGuest() { return !!this.options.online && !this.isHost; }
-
-  sendMsg(event, payload) {
-    if (!this.channel) return Promise.resolve('no-channel');
-    return Promise.resolve(this.channel.send({ type: 'broadcast', event, payload })).catch(() => 'error');
+  initOnline() {
+    if (!this.options.online) return;
+    const o = this.options.online;
+    this.net = { roomCode: o.roomCode, userId: o.userId };
+    this.head = 0; this.inbox = new Map(); this.pumping = false; this.autoTok = 0; this.netFails = 0; this.polling = false;
+    const mk = (seed) => { let a = (Number(seed) >>> 0) || 1; return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; };
+    this.rng2 = mk((Number(this.options.seed) || 1) ^ 0x5bd1e995);   // used only to re-order the deck after a reshuffle
+    this.pollIv = setInterval(() => this.poll(), 700);
+    this.onVis = () => { if (!document.hidden) this.poll(); };
+    document.addEventListener('visibilitychange', this.onVis);
+    this.poll();
   }
 
-  async initOnline() {
-    if (!this.options.online) return;
-    this.seq = 0; this.remoteQ = []; this.handled = new Set();
-    this.pending = null; this.intentN = 0; this.session = Math.random().toString(36).slice(2, 8);
+  teardownOnline() {
+    clearInterval(this.pollIv);
+    if (this.onVis) document.removeEventListener('visibilitychange', this.onVis);
+  }
 
-    let cfg = window.CARDI_CONFIG;
-    if (!cfg || !cfg.supabaseUrl) {            // BootScene's fetch may have failed: try once more
-      try {
-        const r = await fetch('/config', { headers: { 'x-cardi-client': 'true' } });
-        if (r.ok && (r.headers.get('content-type') || '').includes('json')) cfg = window.CARDI_CONFIG = await r.json();
-      } catch (e) { /* handled below */ }
-    }
-    if (this.dead) return;
-    if (!cfg || !cfg.supabaseUrl || !cfg.supabaseKey || !window.supabase) {
-      this.showToast('Online sync is unavailable. Check your connection and reload.', '#ff6b6b');
+  async api(action, body) {
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 8000);
+    try {
+      const res = await fetch('/api?action=' + action, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ctl.signal });
+      const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error || 'server');
+      return data;
+    } finally { clearTimeout(t); }
+  }
+
+  maxSeq() { let m = this.head; this.inbox.forEach((_, k) => { if (k > m) m = k; }); return m; }
+
+  async poll() {
+    if (this.polling || this.dead) return;
+    this.polling = true;
+    try {
+      const r = await this.api('events', { roomCode: this.net.roomCode, userId: this.net.userId, since: this.maxSeq() });
+      this.netFails = 0;
+      (r.moves || []).forEach((m) => this.enqueue({ seq: m.seq, player: m.player, move: m.move }));
+    } catch (e) {
+      if (++this.netFails === 4) this.showToast('Connection hiccup, reconnecting\u2026', '#e8b923');
+    } finally { this.polling = false; }
+  }
+
+  enqueue(e) {
+    if (this.dead || e.seq <= this.head || this.inbox.has(e.seq)) return;
+    this.inbox.set(e.seq, e);
+    this.pump();
+  }
+
+  /** Apply log rows strictly in order, one at a time (with animations). */
+  async pump() {
+    if (this.pumping) return;
+    this.pumping = true;
+    try {
+      while (!this.dead) {
+        if (this.dealing) { await this.wait(150); continue; }
+        const e = this.inbox.get(this.head + 1);
+        if (!e) break;
+        this.inbox.delete(e.seq);
+        this.head = e.seq;
+        await this.applyEntry(e);
+      }
+    } finally { this.pumping = false; }
+    if (!this.dead && !this.dealing && !this.inbox.has(this.head + 1)) { this.busy = false; this.advance(); }
+  }
+
+  /** Same code on every device, so the result is identical everywhere. Illegal rows are skipped (also identically). */
+  async applyEntry(e) {
+    const s = this.state, m = e.move || {};
+    let next;
+    try {
+      if (s.winnerIndex != null) throw new Error('game over');
+      if (m.type === 'start') {
+        if (s.turnStarted) throw new Error('already started');
+        next = Rules.startTurn(s);
+      } else if (m.type === 'declare') {
+        if (!Rules.canDeclareNiko(s, e.player)) throw new Error('cannot declare');
+        next = Rules.applyMove(s, { type: 'declare', playerIndex: e.player });
+      } else if (m.type === 'play' || m.type === 'draw' || m.type === 'pass') {
+        if (!s.turnStarted || e.player !== s.currentPlayerIndex) throw new Error('not that player\u2019s turn');
+        next = Rules.applyMove(s, m);
+      } else throw new Error('unknown move');
+    } catch (err) {
+      console.warn('skipped move', e.seq, err.message);
+      if (e.player === this.humanIndex) this.showToast('The table moved on. Try again.', '#ff6b6b', 536);
+      this.busy = false;
       return;
     }
+    // After a reshuffle every device re-orders the deck the same way (does not depend on the rules' randomness).
+    if (next.events && next.events.some((v) => v.type === 'reshuffle')) next = { ...next, drawPile: this.canonShuffle(next.drawPile) };
 
-    // ONE client for the whole page (a new one per match leaves duplicate sockets/channels behind).
-    const sb = window.__cardiSb || (window.__cardiSb = window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseKey, { realtime: { params: { eventsPerSecond: 20 } } }));
-    this.sb = sb;
-    const ch = sb.channel('cardi:' + this.options.online.roomCode, { config: { broadcast: { self: false } } });
-    ch.on('broadcast', { event: 'state_update' }, ({ payload }) => this.onRemoteState(payload))
-      .on('broadcast', { event: 'intent' }, ({ payload }) => this.onIntent(payload))
-      .on('broadcast', { event: 'sync_request' }, () => { if (this.isHost) this.pushState(true); })
-      .on('broadcast', { event: 'rejected' }, ({ payload }) => this.onRejected(payload))
-      .subscribe((status) => {
-        if (this.dead) return;
-        if (status === 'SUBSCRIBED') {
-          if (this.isHost) this.pushState(true); else this.sendMsg('sync_request', {});
-        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
-          this.showToast('Connection hiccup, reconnecting\u2026', '#e8b923');
-        }
-      });
-    this.channel = ch;
-
-    if (this.isHost) this.syncIv = setInterval(() => { if (!this.busy && !this.dead) this.pushState(true); }, 3000);
-    else document.addEventListener('visibilitychange', this.onVisSync = () => { if (!document.hidden) this.sendMsg('sync_request', {}); });
-    this.events.once('shutdown', () => { if (this.onVisSync) document.removeEventListener('visibilitychange', this.onVisSync); });
-  }
-
-  /** HOST: publish the current state. resend=true repeats the same version (heartbeat / resync). */
-  pushState(resend = false) {
-    if (!this.options.online || !this.isHost || !this.channel) return;
-    if (!resend) this.seq++;
-    this.sendMsg('state_update', { seq: this.seq, state: this.state });
-  }
-
-  /** GUEST: a new authoritative state arrived. Queue it, play it back in order. */
-  onRemoteState(msg) {
-    if (this.isHost || this.dead || !msg || !msg.state || msg.seq <= this.seq) return;
-    this.remoteQ.push(msg);
-    this.remoteQ.sort((x, y) => x.seq - y.seq);
-    this.drainRemote();
-  }
-
-  async drainRemote() {
-    if (this.draining) return;
-    this.draining = true;
-    try {
-      while (this.remoteQ.length && !this.dead) {
-        if (this.dealing) { await this.wait(200); continue; }          // still dealing the opening hands
-        const msg = this.remoteQ.shift();
-        if (msg.seq <= this.seq) continue;
-        const contiguous = msg.seq === this.seq + 1;                  // a gap means we missed one: just jump
-        this.seq = msg.seq;
-        if (this.pending && msg.seq > this.pending.seq) { this.pending = null; clearTimeout(this.wd); }
-        this.busy = true;
-        if (contiguous && msg.state.events && msg.state.events.length) {
-          this.clearPassTimer(); this.clearToasts(); this.render();
-          try { await this.playEvents(msg.state.events); } catch (e) { console.warn('replay failed', e); }
-          if (!this.alive()) return;
-        }
-        this.state = msg.state;
-        this.busy = false;
-        this.render();
-        this.advance();
-      }
-    } finally { this.draining = false; }
-  }
-
-  /** GUEST: ask the host to perform a move. Retries, then gives the turn back instead of freezing. */
-  sendIntent(move) {
-    this.pending = { id: this.session + ':' + (++this.intentN), seq: this.seq, playerIndex: this.humanIndex, move, tries: 0 };
     this.busy = true;
-    this.clearPassTimer();
-    this.sendMsg('intent', this.pending);
-    this.armWatchdog();
-  }
-
-  armWatchdog() {
-    clearTimeout(this.wd);
-    this.wd = setTimeout(() => {
-      if (!this.pending || this.dead) return;
-      if (this.pending.tries++ < 2) { this.sendMsg('intent', this.pending); this.sendMsg('sync_request', {}); this.armWatchdog(); return; }
-      this.pending = null; this.busy = false;
-      this.showToast('Connection problem. Try your move again.', '#ff6b6b');
-      this.sendMsg('sync_request', {});
-      this.render();
-    }, 3500);
-  }
-
-  onRejected(msg) {
-    if (!this.isGuest() || !this.pending || !msg || msg.id !== this.pending.id) return;
-    this.pending = null; clearTimeout(this.wd);
+    this.clearPassTimer(); this.clearToasts();
+    if (m.type === 'start') { this.nikoWindow = null; this.nikoContainer.setVisible(false); if (this.nikoTimerTween) this.nikoTimerTween.remove(); }
+    this.render();
+    if (m.type === 'start' && next.events.some((v) => v.type === 'foul')) this.announce('FORGOT NIKO!  +1', '#ff6b6b', 36);
+    if (m.type === 'pass') this.seatAction(e.player, 'Passed');
+    try { await this.playEvents(next.events || []); } catch (err) { console.warn('animation failed', err); }
+    if (!this.alive()) return;
+    this.state = next;
     this.busy = false;
-    this.showToast(msg.reason || 'Move rejected', '#ff6b6b', 536);
-    this.selectedCards = [];
     this.render();
   }
 
-  idle(maxMs = 6000) {
-    return new Promise((res) => {
-      const t0 = Date.now();
-      const iv = setInterval(() => {
-        if ((!this.busy && !this.dealing) || this.dead || Date.now() - t0 > maxMs) { clearInterval(iv); res(); }
-      }, 50);
-    });
+  canonShuffle(cards) {
+    const a = cards.slice().sort((x, y) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+    for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(this.rng2() * (i + 1));[a[i], a[j]] = [a[j], a[i]]; }
+    return a;
   }
 
-  /** HOST: a guest wants to do something. Validate, run it through the real rules, broadcast the result. */
-  async onIntent(msg) {
-    if (!this.isHost || this.dead || !msg || !msg.move || !msg.id) return;
-    if (this.handled.has(msg.id)) { this.pushState(true); return; }   // duplicate (guest retry): just resend state
-    this.handled.add(msg.id);
-    const reject = (reason) => { this.sendMsg('rejected', { id: msg.id, reason }); this.pushState(true); };
+  /** Send one action to the log. auto = a system step (start turn / forced draw), not a tap by the player. */
+  async submitMove(move, auto = false) {
+    if (this.dead) return false;
+    if (!auto) { this.busy = true; this.clearPassTimer(); }
+    const seq = this.maxSeq() + 1;
+    try {
+      const r = await this.api('move', { roomCode: this.net.roomCode, userId: this.net.userId, seq, move });
+      this.netFails = 0;
+      (r.moves || []).forEach((m) => this.enqueue({ seq: m.seq, player: m.player, move: m.move }));   // includes our own row, applied right away
+      if (!r.accepted && !auto) { this.showToast('The table moved on. Try again.', '#ff6b6b', 536); }
+      if (!auto && !this.pumping && !this.inbox.has(this.head + 1)) { this.busy = false; this.render(); }
+      return !!r.accepted;
+    } catch (e) {
+      if (!auto) { this.busy = false; this.showToast('Move not sent. Check your connection.', '#ff6b6b', 536); this.render(); }
+      return false;
+    }
+  }
 
-    await this.idle();
-    if (this.dead) return;
-    const s = this.state, pi = msg.playerIndex, mv = msg.move;
-    if (!Number.isInteger(pi) || pi < 1 || pi >= s.players.length || s.players[pi].isBot) return reject('Unknown player');
+  /** Called after the table changed: schedule whatever automatic step comes next. */
+  driveOnline() {
+    const s = this.state, me = this.humanIndex;
+    this.render();
+    const tok = ++this.autoTok, head = this.head;
+    const fire = (ms, move) => this.time.delayedCall(ms, () => { if (!this.dead && this.autoTok === tok && this.head === head) this.submitMove(move, true); });
 
-    if (mv.type === 'declare') {
-      if (!Rules.canDeclareNiko(s, pi)) return reject('Too late for Niko Cardi');
-      this.turnTok = (this.turnTok || 0) + 1;
-      if (this.remoteNikoTimer) this.remoteNikoTimer.remove(false);
-      this.state = Rules.applyMove(s, { type: 'declare', playerIndex: pi });
-      this.render();
-      this.pushState();
-      this.time.delayedCall(400, () => this.beginTurn());
+    if (!s.turnStarted) {
+      if (Rules.canDeclareNiko(s, me)) return;                 // my own Niko window is running (its timer submits 'start' when it ends)
+      const someoneElse = s.players.some((p, i) => i !== me && Rules.canDeclareNiko(s, i));
+      if (someoneElse) { fire(6500, { type: 'start' }); return; }     // their window: only a safety net from me
+      fire(s.currentPlayerIndex === me ? 300 : 2500, { type: 'start' });
       return;
     }
-    if (!['play', 'draw', 'pass'].includes(mv.type)) return reject('Unknown move');
-    if (s.winnerIndex != null || !s.turnStarted || s.currentPlayerIndex !== pi) return reject('Not your turn yet');
-
-    this.lastReject = null;
-    const clean = { type: mv.type };
-    if (Array.isArray(mv.cards)) clean.cards = mv.cards;
-    if (mv.chosenSuit) clean.chosenSuit = mv.chosenSuit;
-    const ok = await this.perform(clean, true);
-    if (!ok) reject(this.lastReject || 'Move rejected');
+    const legal = Rules.getLegalMoves(s.players[s.currentPlayerIndex].hand, s.topCard, s.pendingPunishment, s.currentSuit);
+    if (s.pendingPunishment > 0 && legal.length === 0) {
+      if (s.currentPlayerIndex === me) this.announce('NO ANSWER!', '#ff6b6b', 40);
+      fire(s.currentPlayerIndex === me ? 800 : 3000, { type: 'draw' });
+    }
   }
 
   /* ------------------------------------------------------------------ */
