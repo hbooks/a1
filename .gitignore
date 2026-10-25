@@ -130,7 +130,6 @@ worker-configuration.d.ts
 # ignore the generated file here:
 # sw-generated.js
 # workbox-*.js
-manifest.json
 sw.js
 icons/
 
