@@ -156,7 +156,7 @@ captures/
 .cxx/
 
 # Bubblewrap-specific / TWA config (contains signing info)
-assetlinks.json  # <--- DO NOT commit this, it contains your SHA-256 fingerprint
+# <--- DO NOT commit this, it contains your SHA-256 fingerprint
 twa-manifest.json
 
 # Built output files (APK / AAB)
