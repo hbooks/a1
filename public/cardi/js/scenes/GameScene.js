@@ -73,6 +73,7 @@ class GameScene extends Phaser.Scene {
 
     this.dead = false;
     this.paused = false;
+    this.winShown = false; this.endLayer = null; this.waitLayer = null; this.pause = null; this.rematchBtn = null;
     this.clock = 0;
     this.busy = true;
     this.dealing = true;
@@ -111,6 +112,7 @@ class GameScene extends Phaser.Scene {
       rng = () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
     }
     this.state = GameStateMgr.createGame(roster, rng);
+    if (this.options.scores) this.state.scores = this.options.scores.slice();   // rematch keeps the running score
     this.vw = { human: [], discard: [], discardCount: 0, drawCount: 0, suit: this.state.currentSuit, suitShown: null };
     this.lastDirection = this.state.direction;
 
@@ -1211,12 +1213,15 @@ class GameScene extends Phaser.Scene {
     const s = this.state;
     if (s.winnerIndex != null) {
       this.render();
+      if (this.winShown) return;
+      this.winShown = true;
       const humanWon = s.winnerIndex === this.humanIndex;
       if (humanWon) this.confetti(); else this.flash(0x000000, 0.35);
       this.sfx('sfx_win', 1.0);
       this.announce(humanWon ? 'YOU WIN!' : `${s.players[s.winnerIndex].name} wins`, humanWon ? '#e8b923' : '#ff6b6b', 52, { prio: 2, hold: 1000 });
       this.popupIdle().then(() => {
         if (!this.alive()) return;
+        if (this.options.online) { this.time.delayedCall(250, () => this.showEndOverlay()); return; }
         this.time.delayedCall(250, () => {
           this.cameras.main.fadeOut(380, 0, 0, 0);
           this.time.delayedCall(400, () => this.scene.start('WinScene', {
@@ -1356,33 +1361,41 @@ class GameScene extends Phaser.Scene {
 
   /* ------------------------------------------------------------------ */
   /* ONLINE: one shared, ordered MOVE LOG. No host.                      */
-  /*   - Every action (play / draw / pass / declare Niko / start turn)   */
-  /*     is a row in the database with a sequence number.                */
-  /*   - The database accepts exactly ONE row per number, so two people  */
-  /*     can never disagree about the order.                             */
-  /*   - Every device replays the same rows through the same rules, so   */
-  /*     everybody ends up with the identical table.                     */
-  /*   - Nobody is special: whoever is responsible for an automatic step */
-  /*     (start of turn, forced draw) submits it; everyone else submits  */
-  /*     the same step a few seconds later as a safety net.              */
+  /*   Every action is a numbered row in the database; the database      */
+  /*   accepts one row per number, so the order can never be disputed.   */
+  /*   Every device replays the same rows through the same rules.        */
+  /*   Row types: play / draw / pass / declare / start   (the game)      */
+  /*              pause / resume                          (50s freeze)   */
+  /*              leave                                   (bot takes over)*/
+  /*              rematch                                 (new round)    */
   /* ------------------------------------------------------------------ */
   initOnline() {
     if (!this.options.online) return;
     const o = this.options.online;
     this.net = { roomCode: o.roomCode, userId: o.userId };
-    this.head = 0; this.inbox = new Map(); this.pumping = false; this.autoTok = 0; this.netFails = 0; this.polling = false;
+    this.head = o.baseSeq || 0; this.inbox = new Map(); this.pumping = false; this.autoTok = 0; this.netFails = 0; this.polling = false;
+    this.left = new Set(); this.votes = new Set(); this.pause = null; this.pauseCount = {}; this.clockOffset = 0;
+    this.leaving = false; this.restarting = false; this.resumeSent = false; this.rematchSent = false; this.forfeit = false;
     const mk = (seed) => { let a = (Number(seed) >>> 0) || 1; return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; };
     this.rng2 = mk((Number(this.options.seed) || 1) ^ 0x5bd1e995);   // used only to re-order the deck after a reshuffle
-    this.pollIv = setInterval(() => this.poll(), 700);
     this.onVis = () => { if (!document.hidden) this.poll(); };
     document.addEventListener('visibilitychange', this.onVis);
-    this.poll();
+    // closing the tab = leaving the table (the others are told)
+    this.onHide = () => {
+      if (this.leaving || this.restarting || !navigator.sendBeacon) return;
+      navigator.sendBeacon('/api?action=leave_game', new Blob([JSON.stringify(this.net)], { type: 'application/json' }));
+    };
+    window.addEventListener('pagehide', this.onHide);
+    this.poll().then(() => this.schedulePoll());
   }
 
   teardownOnline() {
-    clearInterval(this.pollIv);
+    clearTimeout(this.pollT); clearInterval(this.pauseIv);
     if (this.onVis) document.removeEventListener('visibilitychange', this.onVis);
+    if (this.onHide) window.removeEventListener('pagehide', this.onHide);
   }
+
+  srvNow() { return Date.now() + (this.clockOffset || 0); }
 
   async api(action, body) {
     const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 8000);
@@ -1390,11 +1403,21 @@ class GameScene extends Phaser.Scene {
       const res = await fetch('/api?action=' + action, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ctl.signal });
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error || 'server');
+      if (data.now) this.clockOffset = data.now - Date.now();
       return data;
     } finally { clearTimeout(t); }
   }
 
   maxSeq() { let m = this.head; this.inbox.forEach((_, k) => { if (k > m) m = k; }); return m; }
+
+  /** Fast while we wait for somebody else, relaxed on our own turn or in a background tab (saves requests and battery). */
+  schedulePoll() {
+    if (this.dead || this.restarting) return;
+    const s = this.state;
+    const myTurn = s && s.turnStarted && s.winnerIndex == null && s.currentPlayerIndex === this.humanIndex && !this.pause;
+    const gap = document.hidden ? 3000 : (myTurn ? 1500 : 700);
+    this.pollT = setTimeout(async () => { await this.poll(); this.schedulePoll(); }, gap);
+  }
 
   async poll() {
     if (this.polling || this.dead) return;
@@ -1419,7 +1442,7 @@ class GameScene extends Phaser.Scene {
     if (this.pumping) return;
     this.pumping = true;
     try {
-      while (!this.dead) {
+      while (!this.dead && !this.restarting) {
         if (this.dealing) { await this.wait(150); continue; }
         const e = this.inbox.get(this.head + 1);
         if (!e) break;
@@ -1428,28 +1451,36 @@ class GameScene extends Phaser.Scene {
         await this.applyEntry(e);
       }
     } finally { this.pumping = false; }
-    if (!this.dead && !this.dealing && !this.inbox.has(this.head + 1)) { this.busy = false; this.advance(); }
+    if (!this.dead && !this.restarting && !this.dealing && !this.inbox.has(this.head + 1)) { this.busy = false; this.advance(); }
   }
 
   /** Same code on every device, so the result is identical everywhere. Illegal rows are skipped (also identically). */
   async applyEntry(e) {
-    const s = this.state, m = e.move || {};
+    const s = this.state, m = e.move || {}, t = m.type;
+    if (t === 'pause') return this.applyPause(e);
+    if (t === 'resume') return this.applyResume(e);
+    if (t === 'leave') return this.applyLeave(e);
+    if (t === 'rematch') return this.applyRematch(e);
+
+    // A bot (a player who left) is played by one of the humans: its rows carry "as".
+    const actor = (m.as != null && s.players[m.as] && s.players[m.as].isBot) ? m.as : e.player;
     let next;
     try {
       if (s.winnerIndex != null) throw new Error('game over');
-      if (m.type === 'start') {
+      if (t === 'start') {
         if (s.turnStarted) throw new Error('already started');
         next = Rules.startTurn(s);
-      } else if (m.type === 'declare') {
-        if (!Rules.canDeclareNiko(s, e.player)) throw new Error('cannot declare');
-        next = Rules.applyMove(s, { type: 'declare', playerIndex: e.player });
-      } else if (m.type === 'play' || m.type === 'draw' || m.type === 'pass') {
-        if (!s.turnStarted || e.player !== s.currentPlayerIndex) throw new Error('not that player\u2019s turn');
-        next = Rules.applyMove(s, m);
+      } else if (t === 'declare') {
+        if (!Rules.canDeclareNiko(s, actor)) throw new Error('cannot declare');
+        next = Rules.applyMove(s, { type: 'declare', playerIndex: actor });
+      } else if (t === 'play' || t === 'draw' || t === 'pass') {
+        if (!s.turnStarted || actor !== s.currentPlayerIndex) throw new Error('not that player\u2019s turn');
+        const mv = { ...m }; delete mv.as; delete mv.ts;
+        next = Rules.applyMove(s, mv);
       } else throw new Error('unknown move');
     } catch (err) {
       console.warn('skipped move', e.seq, err.message);
-      if (e.player === this.humanIndex) this.showToast('The table moved on. Try again.', '#ff6b6b', 536);
+      if (e.player === this.humanIndex && m.as == null) this.showToast('The table moved on. Try again.', '#ff6b6b', 536);
       this.busy = false;
       return;
     }
@@ -1458,10 +1489,10 @@ class GameScene extends Phaser.Scene {
 
     this.busy = true;
     this.clearPassTimer(); this.clearToasts();
-    if (m.type === 'start') { this.nikoWindow = null; this.nikoContainer.setVisible(false); if (this.nikoTimerTween) this.nikoTimerTween.remove(); }
+    if (t === 'start') { this.nikoWindow = null; this.nikoContainer.setVisible(false); if (this.nikoTimerTween) this.nikoTimerTween.remove(); }
     this.render();
-    if (m.type === 'start' && next.events.some((v) => v.type === 'foul')) this.announce('FORGOT NIKO!  +1', '#ff6b6b', 36);
-    if (m.type === 'pass') this.seatAction(e.player, 'Passed');
+    if (t === 'start' && next.events.some((v) => v.type === 'foul')) this.announce('FORGOT NIKO!  +1', '#ff6b6b', 36);
+    if (t === 'pass') this.seatAction(actor, 'Passed');
     try { await this.playEvents(next.events || []); } catch (err) { console.warn('animation failed', err); }
     if (!this.alive()) return;
     this.state = next;
@@ -1475,9 +1506,11 @@ class GameScene extends Phaser.Scene {
     return a;
   }
 
-  /** Send one action to the log. auto = a system step (start turn / forced draw), not a tap by the player. */
+  /* ---------- sending ---------- */
+
+  /** Send one action to the log. auto = a system step (start turn / forced draw / bot), not a tap by the player. */
   async submitMove(move, auto = false) {
-    if (this.dead) return false;
+    if (this.dead || this.restarting) return false;
     if (!auto) { this.busy = true; this.clearPassTimer(); }
     const seq = this.maxSeq() + 1;
     try {
@@ -1493,24 +1526,265 @@ class GameScene extends Phaser.Scene {
     }
   }
 
+  /** For rows that must not get lost (pause, resume, rematch): retry until the database accepts them. */
+  async submitReliable(move, tries = 6) {
+    for (let i = 0; i < tries && !this.dead && !this.restarting; i++) {
+      if (await this.submitMove(move, true)) return true;
+      await new Promise((r) => setTimeout(r, 120 + i * 90));
+    }
+    return false;
+  }
+
+  /* ---------- pause (everyone is told, 50 second limit) ---------- */
+
+  applyPause(e) {
+    const p = e.player, s = this.state;
+    const ok = !this.pause && s.winnerIndex == null && !this.left.has(p) && (this.pauseCount[p] || 0) < 3;
+    if (!ok) {
+      if (p === this.humanIndex) {
+        if (this.paused) this.closePause();                      // we opened our menu before the table said yes
+        this.showToast(this.pause ? 'Someone else paused first' : 'No pauses left this game', '#ffd166');
+      }
+      return;
+    }
+    this.pauseCount[p] = (this.pauseCount[p] || 0) + 1;
+    this.pause = { by: p, ts: (e.move && e.move.ts) || this.srvNow() };
+    this.resumeSent = false;
+    if (p !== this.humanIndex) this.showRemotePause();
+    this.startPauseTicker();
+  }
+
+  applyResume(e) {
+    if (!this.pause) return;
+    const m = e.move || {};
+    const byOwner = e.player === this.pause.by;
+    const timedOut = m.reason === 'timeout' && (m.ts - this.pause.ts) >= 49000;
+    if (!byOwner && !timedOut) return;
+    this.clearPause();
+    if (this.paused) this.closePause();                          // the pauser's own menu closes too
+  }
+
+  clearPause() {
+    this.pause = null;
+    clearInterval(this.pauseIv);
+    if (this.waitLayer) {
+      const l = this.waitLayer; this.waitLayer = null; this.waitCount = null; this.waitBar = null;
+      this.tweens.add({ targets: l, alpha: 0, duration: 180, onComplete: () => l.destroy() });
+    }
+  }
+
+  startPauseTicker() {
+    clearInterval(this.pauseIv);
+    this.pauseIv = setInterval(() => {
+      if (!this.pause || this.dead) return;
+      const rem = 50 - (this.srvNow() - this.pause.ts) / 1000;
+      if (this.waitCount && this.waitCount.active) this.waitCount.setText(rem > 0 ? `Resumes automatically in ${Math.ceil(rem)}s` : 'Resuming\u2026');
+      if (this.waitBar && this.waitBar.active) this.waitBar.clear().fillStyle(0x1a3a2e, 1).fillRoundedRect(-130, 0, 260, 8, 4).fillStyle(0xe8b923, 1).fillRoundedRect(-130, 0, Math.max(8, 260 * Math.max(0, Math.min(1, rem / 50))), 8, 4);
+      if (this.pauseNoteT && this.pauseNoteT.active) this.pauseNoteT.setText(rem > 0 ? `Game resumes automatically in ${Math.ceil(rem)}s` : '');
+      if (rem <= 0 && !this.resumeSent) {
+        if (this.pause.by === this.humanIndex) { this.resumeSent = true; if (this.paused) this.closePause(); else this.submitReliable({ type: 'resume' }); }
+        else if (rem <= -2) { this.resumeSent = true; this.submitReliable({ type: 'resume', reason: 'timeout' }); }   // safety net if the pauser vanished
+      }
+    }, 250);
+  }
+
+  /** The "please wait" box other players see. No buttons: only the pauser (or the 50s timer) can close it. */
+  showRemotePause() {
+    if (this.waitLayer || this.dead || !this.pause) return;
+    const { W, H, FONT } = UI;
+    this.pauseTweens = this.pauseTweens || [];
+    const layer = this.add.container(0, 0).setDepth(Z.pause + 5);
+    this.waitLayer = layer;
+    const dim = this.add.rectangle(W / 2, H / 2, W * 4, H * 4, 0x000000, 0).setInteractive();
+    this.tweens.add({ targets: dim, fillAlpha: 0.8, duration: 240 });
+    const v = this.pausePanel(380, 350, 'GAME PAUSED');
+    const name = this.state.players[this.pause.by].name;
+
+    const ring = this.add.container(0, -22);
+    const base = this.add.graphics(); base.lineStyle(5, 0x2e5242, 1).strokeCircle(0, 0, 28);
+    const arc = this.add.graphics(); arc.lineStyle(5, 0xe8b923, 1); arc.beginPath(); arc.arc(0, 0, 28, 0, Math.PI * 0.75); arc.strokePath();
+    ring.add([base, arc]);
+    this.tweens.add({ targets: arc, angle: 360, duration: 1100, repeat: -1 });
+
+    const who = this.add.text(0, 40, `${name} paused the game`, { fontFamily: FONT, fontSize: '20px', fontStyle: '900', color: '#ffffff', align: 'center', wordWrap: { width: 330 } }).setOrigin(0.5);
+    const wait = this.add.text(0, 74, 'Please wait\u2026', { fontFamily: FONT, fontSize: '15px', color: '#8fb09e' }).setOrigin(0.5);
+    this.waitCount = this.add.text(0, 112, '', { fontFamily: FONT, fontSize: '17px', fontStyle: 'bold', color: '#e8b923' }).setOrigin(0.5);
+    this.waitBar = this.add.graphics().setPosition(0, 138);
+    const suits = ['\u2660', '\u2665', '\u2666', '\u2663'].map((ch, i) => {
+      const t = this.add.text(-45 + i * 30, 168, ch, { fontFamily: FONT, fontSize: '20px', color: i === 1 || i === 2 ? '#ff6b6b' : '#f3ead2' }).setOrigin(0.5).setAlpha(0.25);
+      this.tweens.add({ targets: t, alpha: 1, y: 162, duration: 600, yoyo: true, repeat: -1, delay: i * 180 });
+      return t;
+    });
+    v.add([ring, who, wait, this.waitCount, this.waitBar, ...suits]);
+    layer.add([dim, v]);
+    v.setScale(0.92).setAlpha(0);
+    this.tweens.add({ targets: v, scale: 1, alpha: 1, duration: 240, ease: 'Back.out' });
+  }
+
+  /* ---------- leaving ---------- */
+
+  applyLeave(e) {
+    const p = e.player, s = this.state;
+    if (p == null || !s.players[p] || this.left.has(p) || s.players[p].isBot) return;
+    this.left.add(p);
+    if (this.pause && this.pause.by === p) { this.clearPause(); if (this.paused) this.closePause(); }
+    const name = s.players[p].name;
+    let next = { ...s, players: s.players.map((pl, i) => (i === p ? { ...pl, isBot: true } : pl)) };
+    const humans = next.players.map((pl, i) => i).filter((i) => !next.players[i].isBot && !this.left.has(i));
+    if (s.winnerIndex == null) {
+      if (humans.length === 1) {                                // nobody left to play against: the last one standing wins
+        const w = humans[0];
+        next = { ...next, winnerIndex: w, scores: (s.scores || []).map((x, i) => (i === w ? x + 1 : x)) };
+        this.forfeit = true;
+      } else if (humans.length > 1) {
+        this.showToast(`${name} left. A bot takes the seat.`, '#ffd166');
+      }
+    }
+    this.announce(`${name} left the game`, '#ff9b9b', 34, { prio: 2, hold: 1200 });
+    this.state = next;
+    this.render();
+    this.updateEndOverlay();
+  }
+
+  leaveOnline() {
+    if (this.options.online && !this.leaving) {
+      this.leaving = true;
+      try {
+        fetch('/api?action=leave_game', { method: 'POST', keepalive: true, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(this.net) }).catch(() => { });
+      } catch (e) { /* ignore */ }
+    }
+    this.scene.start('MainMenuScene');
+  }
+
+  /* ---------- rematch ---------- */
+
+  applyRematch(e) {
+    const s = this.state;
+    if (s.winnerIndex == null || this.left.has(e.player) || s.players[e.player].isBot) return;
+    this.votes.add(e.player);
+    this.updateEndOverlay();
+    const need = s.players.map((p, i) => i).filter((i) => !s.players[i].isBot && !this.left.has(i));
+    if (need.length > 0 && need.every((i) => this.votes.has(i))) this.startRematch(e.seq);
+  }
+
+  startRematch(seq) {
+    if (this.restarting) return;
+    this.restarting = true;
+    const s = this.state;
+    const seed = (((Number(this.options.seed) || 1) * 31 + seq) >>> 0) || 1;
+    const opts = {
+      ...this.options,
+      players: s.players.map((p, i) => ({ name: p.name, isBot: p.isBot, isHost: !!(this.options.players && this.options.players[i] && this.options.players[i].isHost) })),
+      seed,
+      scores: (s.scores || []).slice(),
+      online: { ...this.options.online, baseSeq: seq },
+    };
+    this.time.delayedCall(450, () => this.scene.restart(opts));
+    this.showToast('Rematch! Shuffling\u2026', '#6df0a8');
+  }
+
+  onRematchTap() {
+    if (this.rematchSent || this.votes.has(this.humanIndex)) return;
+    this.rematchSent = true;
+    if (this.rematchBtn && this.rematchBtn.active) this.rematchBtn.label.setText('Sending\u2026');
+    this.submitReliable({ type: 'rematch' });
+  }
+
+  /** End-of-game panel for online matches (the offline WinScene stays as it is). */
+  showEndOverlay() {
+    if (this.endLayer || this.dead) return;
+    const { W, H, FONT } = UI, s = this.state, n = s.players.length;
+    this.pauseTweens = this.pauseTweens || [];
+    const humanWon = s.winnerIndex === this.humanIndex;
+    const h = 330 + n * 52;
+    const layer = this.add.container(0, 0).setDepth(Z.pause);
+    this.endLayer = layer;
+    const dim = this.add.rectangle(W / 2, H / 2, W * 4, H * 4, 0x000000, 0).setInteractive();
+    this.tweens.add({ targets: dim, fillAlpha: 0.78, duration: 260 });
+    const v = this.pausePanel(380, h, humanWon ? 'YOU WIN!' : 'GAME OVER');
+    layer.add([dim, v]);
+    const wname = s.players[s.winnerIndex].name;
+    const line = this.forfeit ? `${wname} wins. Everyone else left.` : humanWon ? 'Nice one! You took the table.' : `${wname} wins this round`;
+    v.add(this.add.text(0, -h / 2 + 112, line, { fontFamily: FONT, fontSize: '16px', fontStyle: 'bold', color: '#f3ead2', align: 'center', wordWrap: { width: 320 } }).setOrigin(0.5));
+    this.endRows = [];
+    s.players.forEach((p, i) => {
+      const y = -h / 2 + 165 + i * 52;
+      const g = this.add.graphics();
+      g.fillStyle(0x0f2a1f, 1).fillRoundedRect(-160, y - 22, 320, 44, 12).lineStyle(2, i === s.winnerIndex ? GOLD : 0x2e5242, 1).strokeRoundedRect(-160, y - 22, 320, 44, 12);
+      const nm = this.add.text(-146, y, p.name + (i === this.humanIndex ? ' (you)' : ''), { fontFamily: FONT, fontSize: '17px', fontStyle: '900', color: '#ffffff' }).setOrigin(0, 0.5);
+      const sc = this.add.text(36, y, String(s.scores ? s.scores[i] : 0), { fontFamily: FONT, fontSize: '18px', fontStyle: '900', color: '#e8b923' }).setOrigin(0.5);
+      const st = this.add.text(148, y, '', { fontFamily: FONT, fontSize: '14px', fontStyle: 'bold', color: '#8fb09e' }).setOrigin(1, 0.5);
+      v.add([g, nm, sc, st]);
+      this.endRows.push(st);
+    });
+    this.rematchBtn = this.pauseButton(v, 0, h / 2 - 112, 300, 56, 'Rematch', 'primary', () => this.onRematchTap());
+    this.pauseButton(v, 0, h / 2 - 48, 300, 44, 'Leave table', 'danger', () => this.leaveOnline());
+    v.setScale(0.9).setAlpha(0);
+    this.tweens.add({ targets: v, scale: 1, alpha: 1, duration: 260, ease: 'Back.out' });
+    this.updateEndOverlay();
+  }
+
+  updateEndOverlay() {
+    if (!this.endLayer || !this.endRows) return;
+    const s = this.state;
+    s.players.forEach((p, i) => {
+      const t = this.endRows[i];
+      if (!t || !t.active) return;
+      let txt = 'Deciding\u2026', col = '#8fb09e';
+      if (this.left.has(i)) { txt = 'Left'; col = '#ff9b9b'; }
+      else if (p.isBot) { txt = 'Bot'; col = '#8fb09e'; }
+      else if (this.votes.has(i)) { txt = 'Ready'; col = '#6df0a8'; }
+      t.setText(txt).setColor(col);
+    });
+    const need = s.players.map((p, i) => i).filter((i) => !s.players[i].isBot && !this.left.has(i));
+    const b = this.rematchBtn;
+    if (b && b.active) {
+      if (need.length === 0) { b.setVisible(false); b.disableInteractive(); }
+      else if (this.votes.has(this.humanIndex)) { b.label.setText('Waiting for others\u2026'); b.label.setFontSize('18px'); b.setAlpha(0.65); }
+    }
+  }
+
+  /* ---------- automatic steps ---------- */
+
   /** Called after the table changed: schedule whatever automatic step comes next. */
   driveOnline() {
+    if (this.dead || this.restarting) return;
     const s = this.state, me = this.humanIndex;
     this.render();
     const tok = ++this.autoTok, head = this.head;
-    const fire = (ms, move) => this.time.delayedCall(ms, () => { if (!this.dead && this.autoTok === tok && this.head === head) this.submitMove(move, true); });
+    if (this.pause) return;                                    // frozen while somebody has the game paused (the resume row calls us again)
+
+    // The lowest-numbered human present runs the bots (players who left).
+    const keeper = s.players.findIndex((p, i) => !p.isBot && !this.left.has(i));
+    const mine = (i) => i === me || (s.players[i].isBot && me === keeper);
+    const fire = (ms, move) => this.time.delayedCall(ms, () => {
+      if (!this.dead && !this.pause && this.autoTok === tok && this.head === head) this.submitMove(move, true);
+    });
 
     if (!s.turnStarted) {
-      if (Rules.canDeclareNiko(s, me)) return;                 // my own Niko window is running (its timer submits 'start' when it ends)
-      const someoneElse = s.players.some((p, i) => i !== me && Rules.canDeclareNiko(s, i));
-      if (someoneElse) { fire(6500, { type: 'start' }); return; }     // their window: only a safety net from me
-      fire(s.currentPlayerIndex === me ? 300 : 2500, { type: 'start' });
+      const botNiko = s.players.findIndex((p, i) => p.isBot && Rules.canDeclareNiko(s, i) && !Rules.isSpecial(p.hand[0]));
+      if (botNiko >= 0) { fire(me === keeper ? 500 : 3000, { type: 'declare', as: botNiko }); return; }
+      if (!s.players[me].isBot && Rules.canDeclareNiko(s, me)) return;            // my own Niko window is running (its timer submits 'start')
+      const humanWindow = s.players.some((p, i) => i !== me && !p.isBot && Rules.canDeclareNiko(s, i));
+      if (humanWindow) { fire(6500, { type: 'start' }); return; }                  // their window: only a safety net from me
+      fire(mine(s.currentPlayerIndex) ? 300 : 2500, { type: 'start' });
       return;
     }
-    const legal = Rules.getLegalMoves(s.players[s.currentPlayerIndex].hand, s.topCard, s.pendingPunishment, s.currentSuit);
+
+    const cur = s.currentPlayerIndex;
+    const legal = Rules.getLegalMoves(s.players[cur].hand, s.topCard, s.pendingPunishment, s.currentSuit);
     if (s.pendingPunishment > 0 && legal.length === 0) {
-      if (s.currentPlayerIndex === me) this.announce('NO ANSWER!', '#ff6b6b', 40);
-      fire(s.currentPlayerIndex === me ? 800 : 3000, { type: 'draw' });
+      if (cur === me) this.announce('NO ANSWER!', '#ff6b6b', 40);
+      fire(mine(cur) ? 800 : 3000, { type: 'draw' });
+      return;
+    }
+    if (s.players[cur].isBot) {
+      this.time.delayedCall(me === keeper ? 900 + Math.random() * 500 : 4500, () => {
+        if (this.dead || this.pause || this.autoTok !== tok || this.head !== head) return;
+        let mv = Bot.chooseMove(this.state, cur);
+        mv = mv.type === 'declare' ? { type: 'declare', as: cur } : { ...mv, as: cur };
+        this.submitMove(mv, true);
+      });
     }
   }
 
@@ -1740,12 +2014,19 @@ class GameScene extends Phaser.Scene {
   /* PAUSE MENU                                                          */
   /* ------------------------------------------------------------------ */
   onEsc() {
+    if (this.options.online && this.pause && this.pause.by !== this.humanIndex) return;   // somebody else paused: nothing to open
     if (this.paused) { if (this.pauseMode === 'moves') this.showPauseMain(); else this.closePause(); }
     else this.openPause();
   }
 
   openPause() {
     if (this.paused || this.modal || this.dead) return;
+    if (this.options.online) {
+      if (this.pause || this.restarting || this.state.winnerIndex != null) return;       // already paused by someone / game over
+      if ((this.pauseCount[this.humanIndex] || 0) >= 3) { this.showToast('No pauses left this game', '#ff6b6b'); return; }
+      this.resumeSent = false;
+      this.submitReliable({ type: 'pause' });                                            // tell everybody (they see "X paused the game")
+    }
     this.paused = true;
     // freeze everything that is running; the menu's own tweens are created after this
     this.frozenTweens = this.tweens.getTweens().filter((t) => !t.isPaused());
@@ -1777,6 +2058,10 @@ class GameScene extends Phaser.Scene {
     (this.frozenTweens || []).forEach((t) => { if (t.isPaused && t.isPaused()) t.resume(); });
     this.frozenTweens = [];
     this.triggerHint();
+    if (this.options.online && this.pause && this.pause.by === this.humanIndex && !this.resumeSent) {
+      this.resumeSent = true;
+      this.submitReliable({ type: 'resume' });                                           // tell everybody the game is back
+    }
   }
 
   /** shared look for a panel */
@@ -1898,7 +2183,7 @@ class GameScene extends Phaser.Scene {
         b.label.setText('Tap again to leave');
         this.pt({ targets: b, scale: { from: 1.06, to: 1 }, duration: 200 });
         this.pt({ targets: b, alpha: 1, delay: 2400, duration: 10, onComplete: () => { this.leaveArmed = false; if (b.label.scene) b.label.setText('Leave table'); } });
-      } else { this.leaveArmed = false; this.scene.start('MainMenuScene'); }
+      } else { this.leaveArmed = false; this.leaveOnline(); }
     });
     leave.label.setFontSize('17px');
 

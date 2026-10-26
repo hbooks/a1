@@ -113,15 +113,61 @@ async function sweepAbandoned(sql: Sql) {
     WHERE r.status = 'waiting' AND NOT EXISTS (SELECT 1 FROM cardi_room_players p WHERE p.room_id = r.id)`;
 }
 
+function safeEqual(a: string, b: string) {
+    if (a.length !== b.length) return false;
+    let d = 0;
+    for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    return d === 0;
+}
+
+/** Called by cron-job.org (header "Authorization: Bearer <CRON_SECRET>"). Removes finished / abandoned rooms. */
+async function runCleanup(request: Request) {
+    const secret = process.env["CRON_SECRET"];
+    const dbUrl = process.env["DATABASE_URL"];
+    if (!secret || !dbUrl) return fail(503, "disabled", "CRON_SECRET or DATABASE_URL is not set.");
+    const given = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
+    if (!safeEqual(given, secret)) return fail(401, "unauthorized", "Unauthorized");
+    const sql = neon(dbUrl);
+
+    // A room is idle when nothing happened in it for an hour (no move, no heartbeat).
+    const idle = rows<{ id: Id }>(
+        await sql`
+      SELECT r.id FROM cardi_rooms r
+      WHERE GREATEST(
+              COALESCE((SELECT MAX(m.created_at) FROM cardi_moves m WHERE m.room_code = r.room_code), '-infinity'::timestamptz),
+              COALESCE((SELECT MAX(p.last_seen) FROM cardi_room_players p WHERE p.room_id = r.id), '-infinity'::timestamptz)
+            ) < now() - interval '1 hour'
+      LIMIT 500`,
+    );
+    for (const r of idle) await destroyRoom(sql, r.id);
+
+    const moves = rows<{ x: number }>(
+        await sql`DELETE FROM cardi_moves m
+              WHERE m.created_at < now() - interval '1 hour'
+                AND NOT EXISTS (SELECT 1 FROM cardi_rooms r WHERE r.room_code = m.room_code)
+              RETURNING 1 AS x`,
+    );
+    const players = rows<{ x: number }>(
+        await sql`DELETE FROM cardi_room_players p
+              WHERE NOT EXISTS (SELECT 1 FROM cardi_rooms r WHERE r.id = p.room_id)
+              RETURNING 1 AS x`,
+    );
+    return json({ ok: true, roomsDeleted: idle.length, orphanMoves: moves.length, orphanPlayers: players.length });
+}
+
 export const Route = createFileRoute("/api")({
     server: {
         handlers: {
             // Health check: open https://a.hpbooks.uk/api in the browser
-            GET: async () => json({ ok: true, hasDb: !!process.env["DATABASE_URL"] }),
+            GET: async ({ request }) => {
+                if (new URL(request.url).searchParams.get("action") === "cleanup") return runCleanup(request);
+                return json({ ok: true, hasDb: !!process.env["DATABASE_URL"] });
+            },
 
             POST: async ({ request }) => {
                 const url = new URL(request.url);
                 const action = url.searchParams.get("action");
+                if (action === "cleanup") return runCleanup(request);
 
                 const dbUrl = process.env["DATABASE_URL"];
                 if (!dbUrl) return fail(500, "server", "Database configuration missing");
@@ -321,9 +367,9 @@ export const Route = createFileRoute("/api")({
                         const mv = body.move;
                         if (roomCode.length !== 6 || !validId(userId)) return fail(400, "bad_request", "Bad request.");
                         if (!(seq >= 1 && seq < 100000)) return fail(400, "bad_request", "Bad sequence number.");
-                        if (!mv || typeof mv !== "object" || !["play", "draw", "pass", "declare", "start"].includes(mv.type))
+                        if (!mv || typeof mv !== "object" || !["play", "draw", "pass", "declare", "start", "pause", "resume", "rematch"].includes(mv.type))
                             return fail(400, "bad_request", "Unknown move.");
-                        const text = JSON.stringify(mv);
+                        const text = JSON.stringify({ ...mv, ts: Date.now() }); // server clock, so every device agrees on 'when'
                         if (text.length > 4000) return fail(400, "bad_request", "Move too large.");
 
                         const me = rows<{ seat_index: number; status: string }>(
@@ -354,8 +400,35 @@ export const Route = createFileRoute("/api")({
                         );
                         return json({
                             accepted,
+                            now: Date.now(),
                             moves: moves.map((m) => ({ seq: m.seq, player: m.player_index, move: m.payload })),
                         });
+                    }
+
+                    if (action === "leave_game") {
+                        const roomCode = normCode(body.roomCode);
+                        const userId = body.userId;
+                        if (roomCode.length !== 6 || !validId(userId)) return json({ success: true });
+                        const me = rows<{ seat_index: number; status: string }>(
+                            await sql`
+                SELECT p.seat_index, r.status
+                FROM cardi_room_players p JOIN cardi_rooms r ON r.id = p.room_id
+                WHERE r.room_code = ${roomCode} AND p.user_id = ${userId}`,
+                        )[0];
+                        if (!me || me.status !== "playing") return json({ success: true });
+                        const text = JSON.stringify({ type: "leave", ts: Date.now() });
+                        for (let i = 0; i < 6; i++) {
+                            try {
+                                await sql`
+                  INSERT INTO cardi_moves (room_code, seq, player_index, payload)
+                  SELECT ${roomCode}::text, COALESCE(MAX(m.seq), 0) + 1, ${me.seat_index}::int, ${text}::jsonb
+                  FROM cardi_moves m WHERE m.room_code = ${roomCode}::text`;
+                                break;
+                            } catch (e: any) {
+                                if (e.code !== "23505") throw e; // someone else took that number: try the next one
+                            }
+                        }
+                        return json({ success: true });
                     }
 
                     if (action === "events") {
@@ -373,7 +446,7 @@ export const Route = createFileRoute("/api")({
                     WHERE r.room_code = ${roomCode}::text AND p.user_id = ${userId})
                 ORDER BY m.seq LIMIT 200`,
                         );
-                        return json({ moves: moves.map((m) => ({ seq: m.seq, player: m.player_index, move: m.payload })) });
+                        return json({ now: Date.now(), moves: moves.map((m) => ({ seq: m.seq, player: m.player_index, move: m.payload })) });
                     }
 
                     return fail(400, "bad_request", "Invalid action");

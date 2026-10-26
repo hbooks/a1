@@ -5,6 +5,14 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
   <title>Cardi — The Kenyan Card Game</title>
+
+  <!-- PWA & Mobile Web App Settings -->
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="theme-color" content="#E8B923" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+  <!-- Fonts -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Nunito:ital,wght@0,400;0,700;0,900;1,400&display=swap"
@@ -20,6 +28,7 @@
 
 <body>
   <div id="game"></div>
+
   <!-- Pure logic first (no Phaser), then UI, scenes, and bootstrap. -->
   <script src="js/rules.js"></script>
   <script src="js/gameState.js"></script>
@@ -31,6 +40,35 @@
   <script src="js/scenes/WinScene.js"></script>
   <script src="js/scenes/ShopScene.js"></script>
   <script src="js/main.js"></script>
+
+  <!-- Register PWA Service Worker -->
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js').then((reg) => {
+
+          // Check for updates to the Service Worker
+          reg.onupdatefound = () => {
+            const installingWorker = reg.installing;
+            if (installingWorker == null) return;
+
+            installingWorker.onstatechange = () => {
+              if (installingWorker.state === 'installed') {
+                if (navigator.serviceWorker.controller) {
+                  // New update available! Prompt the user.
+                  const userWantsToUpdate = confirm('A new version of Cardi is available. Update now?');
+                  if (userWantsToUpdate) {
+                    installingWorker.postMessage({ action: 'skipWaiting' });
+                    window.location.reload();
+                  }
+                }
+              }
+            };
+          };
+        });
+      });
+    }
+  </script>
 </body>
 
 </html>
